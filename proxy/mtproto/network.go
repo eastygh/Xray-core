@@ -11,10 +11,7 @@ import (
 	"github.com/9seconds/mtg/v2/essentials"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
-	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/transport"
-	"github.com/xtls/xray-core/transport/pipe"
 )
 
 type xrayNetwork struct {
@@ -53,26 +50,14 @@ func (n *xrayNetwork) DialContext(ctx context.Context, network, address string) 
 
 	dispCtx := n.getContext()
 
-	outbounds := session.OutboundsFromContext(dispCtx)
-	if len(outbounds) > 0 {
-		ob := outbounds[len(outbounds)-1]
-		ob.Target = dest
-	}
-
-	uplinkReader, uplinkWriter := pipe.New(pipe.WithoutSizeLimit())
-	downlinkReader, downlinkWriter := pipe.New(pipe.WithoutSizeLimit())
-
-	err := n.dispatcher.DispatchLink(dispCtx, dest, &transport.Link{
-		Reader: uplinkReader,
-		Writer: downlinkWriter,
-	})
+	link, err := n.dispatcher.Dispatch(dispCtx, dest)
 	if err != nil {
 		return nil, err
 	}
 
 	conn := cnc.NewConnection(
-		cnc.ConnectionInputMulti(uplinkWriter),
-		cnc.ConnectionOutputMulti(downlinkReader),
+		cnc.ConnectionInputMulti(link.Writer),
+		cnc.ConnectionOutputMulti(link.Reader),
 		cnc.ConnectionRemoteAddr(&net.TCPAddr{IP: dest.Address.IP(), Port: int(dest.Port)}),
 	)
 
