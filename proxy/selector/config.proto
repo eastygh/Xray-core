@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package xray.proxy.selector;
+option csharp_namespace = "Xray.Proxy.Selector";
+option go_package = "github.com/xtls/xray-core/proxy/selector";
+option java_package = "com.xray.proxy.selector";
+option java_multiple_files = true;
+
+message Rule {
+  string match = 1;
+  string pattern = 2;
+  string handler_tag = 3;
+}
+
+message Config {
+  repeated Rule rules = 1;
+  string default_handler_tag = 2;
+  int32 read_size = 3;
+}
