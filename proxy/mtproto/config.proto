@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package xray.proxy.mtproto;
+option go_package = "github.com/xtls/xray-core/proxy/mtproto";
+
+message Config {
+  string secret = 1;
+  uint32 concurrency = 2;
+  bool allow_fallback_on_unknown_dc = 3;
+  string prefer_ip = 4;
+  bool auto_update = 5;
+  uint32 domain_fronting_port = 6;
+  uint32 tolerate_time_skewness_seconds = 7;
+  bool anti_replay = 8;
+}
