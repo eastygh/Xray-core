@@ -541,3 +541,127 @@ Selector читает **сырые байты до TLS-расшифровки**.
 ### MTProto детекция
 
 Детекция MTProto основана на эвристике (не TLS, не HTTP, >= 64 байт, высокая энтропия). Это может давать ложные срабатывания на другие бинарные протоколы. Рекомендуется ставить правило `mtproto` **после** `tls` и `notls` правил, чтобы оно срабатывало только на нераспознанный бинарный трафик.
+
+---
+
+# MTProto Proxy — принципы работы и конфигурация
+
+## Принцип работы
+
+MTProto — это inbound-proxy для проксирования трафика Telegram по протоколу MTProto. Реализован на базе библиотеки [mtg v2](https://github.com/9seconds/mtg). Хендлер принимает входящие MTProto-соединения от Telegram-клиентов и проксирует их к серверам Telegram через Xray routing/outbound.
+
+### Цепочка обработки
+
+```
+Telegram-клиент → TCP → MTProto Handler
+                          │
+                          ├─ Парсит MTProto secret → расшифровывает обфускацию
+                          ├─ Определяет целевой DC Telegram
+                          ├─ Создает исходящее соединение через Xray dispatcher
+                          │    └─ dispatcher → routing → outbound (freedom/proxy)
+                          └─ Проксирует трафик клиент ↔ DC Telegram
+```
+
+### Ключевые детали
+
+**mtglib.Proxy** — ядро обработки. Библиотека mtg берет на себя криптографию MTProto (obfuscated2), anti-replay защиту, определение DC и domain fronting.
+
+**xrayNetwork** — адаптер, реализующий интерфейс `mtglib.Network`. Все исходящие соединения от mtg проходят через Xray dispatcher, что позволяет использовать routing-правила и любые outbound-протоколы для выхода в интернет.
+
+**Secret** — ключ MTProto в формате hex (без префикса `dd`). Должен быть сгенерирован утилитой `mtg generate-secret`. Клиенту передается secret с префиксом `dd` + hex-кодированный домен для FakeTLS.
+
+## Параметры конфигурации
+
+```json
+{
+  "protocol": "mtproto",
+  "settings": {
+    "secret": "hex-строка секрета",
+    "concurrency": 8,
+    "allowFallbackOnUnknownDc": true,
+    "preferIp": "prefer-ipv6",
+    "autoUpdate": true,
+    "domainFrontingPort": 443,
+    "tolerateTimeSkewnessSeconds": 120,
+    "antiReplay": true
+  }
+}
+```
+
+| Поле | Тип | По умолчанию | Описание |
+|---|---|---|---|
+| `secret` | string | **обязательно** | MTProto secret в hex-формате. Генерируется `mtg generate-secret <domain>` |
+| `concurrency` | uint | 8 (mtglib default) | Количество горутин для обработки соединений |
+| `allowFallbackOnUnknownDc` | bool | false | Разрешить фоллбэк на ближайший DC, если целевой DC неизвестен |
+| `preferIp` | string | "prefer-ipv6" | Предпочтение IP-версии: `"prefer-ipv4"`, `"prefer-ipv6"`, `"only-ipv4"`, `"only-ipv6"` |
+| `autoUpdate` | bool | false | Автоматически обновлять список DC Telegram |
+| `domainFrontingPort` | uint | 443 | Порт для domain fronting соединений |
+| `tolerateTimeSkewnessSeconds` | uint | 120 (mtglib default) | Допустимый рассинхрон времени в секундах (для anti-replay) |
+| `antiReplay` | bool | false | Включить anti-replay кэш (Stable Bloom Filter) для защиты от replay-атак |
+
+## Пример: MTProto с выходом через freedom
+
+```json
+{
+  "inbounds": [
+    {
+      "tag": "mtproto1",
+      "port": 9443,
+      "protocol": "mtproto",
+      "settings": {
+        "secret": "00000000000000000000000000000001"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    }
+  ]
+}
+```
+
+## Использование с Selector
+
+MTProto хендлер можно использовать совместно с Selector для мультиплексирования на одном порту. Selector детектирует MTProto-трафик по эвристике (высокая энтропия, не TLS, не HTTP) и делегирует его MTProto-хендлеру.
+
+```json
+{
+  "inbounds": [
+    {
+      "tag": "selector-in",
+      "port": 443,
+      "protocol": "selector",
+      "settings": {
+        "rules": [
+          { "match": "tls", "handlerTag": "vless-in" },
+          { "match": "mtproto", "handlerTag": "mtproto-in" }
+        ]
+      }
+    },
+    {
+      "tag": "mtproto-in",
+      "listen": "127.0.0.1",
+      "port": 9443,
+      "protocol": "mtproto",
+      "settings": {
+        "secret": "00000000000000000000000000000001",
+        "antiReplay": true
+      }
+    }
+  ]
+}
+```
+
+### Генерация secret
+
+```bash
+# Установить mtg
+go install github.com/9seconds/mtg/v2@latest
+
+# Сгенерировать secret с FakeTLS-доменом
+mtg generate-secret tls ya.ru
+# Вернет: ee<hex>... — передать клиенту целиком
+# В конфиг Xray — только hex-часть без префикса dd
+```

@@ -1,0 +1,94 @@
+{
+  "log": {
+    "loglevel": "debug"
+  },
+  "inbounds": [
+    {
+      "tag": "selector-in",
+      "port": 443,
+      "listen": "0.0.0.0",
+      "protocol": "selector",
+      "settings": {
+        "rules": [
+          {
+            "match": "tls",
+            "pattern": "^ya\\.ru$",
+            "handlerTag": "vless1"
+          },
+          {
+            "match": "mtproto",
+            "handlerTag": "mtproto1"
+          }
+        ],
+        "defaultHandlerTag": "vless1"
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    },
+    {
+      "tag": "vless1",
+      "listen": "127.0.0.1",
+      "port": 10001,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "flow": "xtls-rprx-vision"
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [
+            {
+              "certificateFile": "/etc/ssl/ya.ru.crt",
+              "keyFile": "/etc/ssl/ya.ru.key"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "tag": "mtproto1",
+      "listen": "127.0.0.1",
+      "port": 10002,
+      "protocol": "mtproto",
+      "settings": {
+        "secret": "00000000000000000000000000000001",
+        "antiReplay": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "vless-out",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "example.com",
+            "port": 443,
+            "users": [
+              {
+                "id": "00000000-0000-0000-0000-000000000002",
+                "encryption": "none",
+                "flow": "xtls-rprx-vision"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "example.com"
+        }
+      }
+    }
+  ]
+}
