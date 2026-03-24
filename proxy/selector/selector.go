@@ -7,6 +7,7 @@ import (
 	"net"
 	"regexp"
 
+	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	xnet "github.com/xtls/xray-core/common/net"
@@ -14,7 +15,10 @@ import (
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
 const defaultReadSize = 2048
@@ -104,8 +108,28 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 	}
 	inboundProxy := gi.GetInbound()
 
-	// 5. Wrap connection with buffered bytes
-	wrappedConn := newBufferedConn(conn, firstBytes)
+	// 5. Wrap connection with buffered bytes and apply transport-layer security.
+	// When calling proxy.Process() directly we bypass the transport layer (TLS/Reality)
+	// that is normally applied by the listener pipeline in keepAccepting().
+	// We must replicate that here so the target proxy receives decrypted data.
+	var wrappedConn = newBufferedConn(conn, firstBytes)
+	if rs := handler.(inbound.Handler).ReceiverSettings(); rs != nil {
+		if msg, err := rs.GetInstance(); err == nil {
+			if rc, ok := msg.(*proxyman.ReceiverConfig); ok && rc.StreamSettings != nil {
+				if mss, err := internet.ToMemoryStreamConfig(rc.StreamSettings); err == nil {
+					if tlsConfig := tls.ConfigFromStreamSettings(mss); tlsConfig != nil {
+						wrappedConn = stat.Connection(tls.Server(wrappedConn, tlsConfig.GetTLSConfig()))
+					} else if realityConfig := reality.ConfigFromStreamSettings(mss); realityConfig != nil {
+						realityConn, err := reality.Server(wrappedConn, realityConfig.GetREALITYConfig())
+						if err != nil {
+							return errors.New("selector: transport handshake failed for handler [", handlerTag, "]").Base(err)
+						}
+						wrappedConn = stat.Connection(realityConn)
+					}
+				}
+			}
+		}
+	}
 
 	// 6. Delegate to target handler
 	return inboundProxy.Process(ctx, network, wrappedConn, dispatcher)
