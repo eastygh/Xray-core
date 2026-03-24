@@ -189,6 +189,15 @@ func (c *bufferedConn) Read(b []byte) (int, error) {
 	return c.reader.Read(b)
 }
 
+// CloseWrite is required by reality.CloseWriteConn interface.
+// Delegates to the underlying connection if it supports half-close.
+func (c *bufferedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
 func init() {
 	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		s := new(Selector)
