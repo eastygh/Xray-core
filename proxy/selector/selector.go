@@ -3,9 +3,11 @@ package selector
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"regexp"
+	"sync"
 
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
@@ -15,10 +17,7 @@ import (
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/proxy"
-	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
-	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
 const defaultReadSize = 2048
@@ -102,37 +101,102 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 		return errors.New("selector: handler not found: ", handlerTag).Base(err)
 	}
 
+	// 5. Wrap connection to replay consumed bytes
+	wrappedConn := newBufferedConn(conn, firstBytes)
+
+	// 6. If the target handler has transport-layer security (TLS/Reality/etc.),
+	// we cannot call proxy.Process() directly because that bypasses the transport
+	// stack. Instead, pipe the raw connection to the handler's own listener so
+	// the native transport code handles TLS/Reality/WS/gRPC/etc.
+	if addr := getHandlerListenAddr(handler); addr != "" {
+		errors.LogInfo(ctx, "selector: piping to handler listener at ", addr)
+		return pipeToListener(wrappedConn, addr)
+	}
+
+	// 7. No transport security — delegate to proxy directly
 	gi, ok := handler.(proxy.GetInbound)
 	if !ok {
 		return errors.New("selector: handler [", handlerTag, "] does not expose proxy.Inbound")
 	}
-	inboundProxy := gi.GetInbound()
+	return gi.GetInbound().Process(ctx, network, wrappedConn, dispatcher)
+}
 
-	// 5. Wrap connection with buffered bytes and apply transport-layer security.
-	// When calling proxy.Process() directly we bypass the transport layer (TLS/Reality)
-	// that is normally applied by the listener pipeline in keepAccepting().
-	// We must replicate that here so the target proxy receives decrypted data.
-	var wrappedConn = newBufferedConn(conn, firstBytes)
-	if rs := handler.(inbound.Handler).ReceiverSettings(); rs != nil {
-		if msg, err := rs.GetInstance(); err == nil {
-			if rc, ok := msg.(*proxyman.ReceiverConfig); ok && rc.StreamSettings != nil {
-				if mss, err := internet.ToMemoryStreamConfig(rc.StreamSettings); err == nil {
-					if tlsConfig := tls.ConfigFromStreamSettings(mss); tlsConfig != nil {
-						wrappedConn = stat.Connection(tls.Server(wrappedConn, tlsConfig.GetTLSConfig()))
-					} else if realityConfig := reality.ConfigFromStreamSettings(mss); realityConfig != nil {
-						realityConn, err := reality.Server(wrappedConn, realityConfig.GetREALITYConfig())
-						if err != nil {
-							return errors.New("selector: transport handshake failed for handler [", handlerTag, "]").Base(err)
-						}
-						wrappedConn = stat.Connection(realityConn)
-					}
-				}
+// getHandlerListenAddr returns "host:port" of the handler's listener if it has
+// transport-layer security configured. Returns "" if direct proxy.Process() is safe.
+func getHandlerListenAddr(handler inbound.Handler) string {
+	rs := handler.ReceiverSettings()
+	if rs == nil {
+		return ""
+	}
+	msg, err := rs.GetInstance()
+	if err != nil {
+		return ""
+	}
+	rc, ok := msg.(*proxyman.ReceiverConfig)
+	if !ok {
+		return ""
+	}
+
+	// Only pipe when there is transport security that the listener must handle
+	if rc.StreamSettings == nil || !rc.StreamSettings.HasSecuritySettings() {
+		return ""
+	}
+
+	// Need a port to connect to
+	if rc.PortList == nil || len(rc.PortList.Range) == 0 {
+		return ""
+	}
+	port := rc.PortList.Range[0].From
+
+	addr := "127.0.0.1"
+	if rc.Listen != nil {
+		if a := rc.Listen.AsAddress(); a != nil {
+			s := a.String()
+			// If handler listens on 0.0.0.0 or ::, connect via loopback
+			if s != "0.0.0.0" && s != "::" {
+				addr = s
 			}
 		}
 	}
 
-	// 6. Delegate to target handler
-	return inboundProxy.Process(ctx, network, wrappedConn, dispatcher)
+	return fmt.Sprintf("%s:%d", addr, port)
+}
+
+// pipeToListener connects to the handler's actual listener and bidirectionally
+// copies data. This lets the handler's full transport stack (TLS/Reality/WS/gRPC)
+// process the connection natively — the same approach used by VLESS fallbacks.
+func pipeToListener(clientConn stat.Connection, addr string) error {
+	targetConn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return errors.New("selector: failed to connect to handler listener at ", addr).Base(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// client → handler listener
+	go func() {
+		io.Copy(targetConn, clientConn)
+		// Signal write-done to target so TLS knows the stream ended
+		if tc, ok := targetConn.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+		wg.Done()
+	}()
+
+	// handler listener → client
+	go func() {
+		io.Copy(clientConn, targetConn)
+		// Signal write-done to client
+		if cw, ok := clientConn.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		}
+		wg.Done()
+	}()
+
+	wg.Wait()
+	targetConn.Close()
+	return nil
 }
 
 // matchRules finds the first matching rule for the detection result.
@@ -189,8 +253,7 @@ func (c *bufferedConn) Read(b []byte) (int, error) {
 	return c.reader.Read(b)
 }
 
-// CloseWrite is required by reality.CloseWriteConn interface.
-// Delegates to the underlying connection if it supports half-close.
+// CloseWrite delegates half-close to the underlying connection.
 func (c *bufferedConn) CloseWrite() error {
 	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
