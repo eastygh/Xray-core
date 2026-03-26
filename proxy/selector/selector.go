@@ -6,7 +6,6 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	xnet "github.com/xtls/xray-core/common/net"
@@ -14,10 +13,7 @@ import (
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/proxy"
-	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
-	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
 const (
@@ -25,6 +21,12 @@ const (
 	defaultPeekTimeout = 5 * time.Second
 	defaultMinPeekSize = 16 // enough for TLS record header (5) + handshake type (1) + length (3) + version (2) + random start
 )
+
+// transportApplier is implemented by handlers that can apply their
+// transport-layer security (TLS/Reality) to an external connection.
+type transportApplier interface {
+	ApplyTransport(conn net.Conn) (net.Conn, error)
+}
 
 // compiledRule is a pre-compiled routing rule.
 type compiledRule struct {
@@ -88,9 +90,6 @@ func (s *Selector) Network() []xnet.Network {
 // Process implements proxy.Inbound.
 func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	// 1. Peek at first bytes WITHOUT consuming them from the socket buffer.
-	// Uses MSG_PEEK so the original connection stays untouched, preserving
-	// all native interfaces (CloseWrite, SyscallConn, etc.) for TLS/Reality.
-	// Waits until at least minPeekSize bytes are available or timeout expires.
 	firstBytes, err := peekBytes(conn, s.readSize, s.minPeekSize, s.peekTimeout)
 	if err != nil {
 		return errors.New("failed to peek first bytes").Base(err)
@@ -124,13 +123,15 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 	}
 	inboundProxy := gi.GetInbound()
 
-	// 5. If the target handler has transport-layer security (TLS/Reality),
-	// apply it to the original connection. The peeked bytes are still in the
-	// socket buffer, so the transport layer reads them natively.
+	// 5. Let the handler apply its own transport security (TLS/Reality).
+	// The peeked bytes are still in the socket buffer — the transport
+	// layer reads them natively via normal Read().
 	processConn := unwrapRawConn(conn)
-	processConn, err = applyTransportSecurity(processConn, handler)
-	if err != nil {
-		return errors.New("selector: transport handshake failed for handler [", handlerTag, "]").Base(err)
+	if ta, ok := handler.(transportApplier); ok {
+		processConn, err = ta.ApplyTransport(processConn)
+		if err != nil {
+			return errors.New("selector: transport handshake failed for handler [", handlerTag, "]").Base(err)
+		}
 	}
 
 	// 6. Delegate to target proxy
@@ -141,36 +142,6 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 // net.Conn (typically *net.TCPConn) with native interface support.
 func unwrapRawConn(conn stat.Connection) net.Conn {
 	return stat.TryUnwrapStatsConn(conn)
-}
-
-// applyTransportSecurity checks if the handler has TLS/Reality configured
-// in its stream settings and applies the server-side transport handshake.
-// For handlers without transport security, returns the connection unchanged.
-func applyTransportSecurity(conn net.Conn, handler inbound.Handler) (net.Conn, error) {
-	rs := handler.ReceiverSettings()
-	if rs == nil {
-		return conn, nil
-	}
-	msg, err := rs.GetInstance()
-	if err != nil {
-		return conn, nil
-	}
-	rc, ok := msg.(*proxyman.ReceiverConfig)
-	if !ok || rc.StreamSettings == nil || !rc.StreamSettings.HasSecuritySettings() {
-		return conn, nil
-	}
-	mss, err := internet.ToMemoryStreamConfig(rc.StreamSettings)
-	if err != nil {
-		return conn, nil
-	}
-
-	if tlsConfig := tls.ConfigFromStreamSettings(mss); tlsConfig != nil {
-		return tls.Server(conn, tlsConfig.GetTLSConfig()), nil
-	}
-	if realityConfig := reality.ConfigFromStreamSettings(mss); realityConfig != nil {
-		return reality.Server(conn, realityConfig.GetREALITYConfig())
-	}
-	return conn, nil
 }
 
 // matchRules finds the first matching rule for the detection result.

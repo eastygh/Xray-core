@@ -15,6 +15,8 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/reality"
+	"github.com/xtls/xray-core/transport/internet/tls"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -50,6 +52,7 @@ type AlwaysOnInboundHandler struct {
 	workers        []worker
 	mux            *mux.Server
 	tag            string
+	streamConfig   *internet.MemoryStreamConfig
 }
 
 func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *proxyman.ReceiverConfig, proxyConfig interface{}) (*AlwaysOnInboundHandler, error) {
@@ -97,6 +100,7 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 	if err != nil {
 		return nil, errors.New("failed to parse stream config").Base(err).AtWarning()
 	}
+	h.streamConfig = mss
 
 	if receiverConfig.ReceiveOriginalDestination {
 		if mss.SocketSettings == nil {
@@ -203,6 +207,22 @@ func (h *AlwaysOnInboundHandler) GetInbound() proxy.Inbound {
 // ReceiverSettings implements inbound.Handler.
 func (h *AlwaysOnInboundHandler) ReceiverSettings() *serial.TypedMessage {
 	return serial.ToTypedMessage(h.receiverConfig)
+}
+
+// ApplyTransport wraps the connection with the handler's transport-layer
+// security (TLS/Reality) if configured. Uses the same MemoryStreamConfig
+// that was parsed at handler init time — no protobuf roundtrip.
+func (h *AlwaysOnInboundHandler) ApplyTransport(conn net.Conn) (net.Conn, error) {
+	if h.streamConfig == nil {
+		return conn, nil
+	}
+	if tlsConfig := tls.ConfigFromStreamSettings(h.streamConfig); tlsConfig != nil {
+		return tls.Server(conn, tlsConfig.GetTLSConfig()), nil
+	}
+	if realityConfig := reality.ConfigFromStreamSettings(h.streamConfig); realityConfig != nil {
+		return reality.Server(conn, realityConfig.GetREALITYConfig())
+	}
+	return conn, nil
 }
 
 // ProxySettings implements inbound.Handler.
