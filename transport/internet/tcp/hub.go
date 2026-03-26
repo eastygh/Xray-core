@@ -130,6 +130,25 @@ func (v *Listener) keepAccepting() {
 	}
 }
 
+// HandleConnection processes an externally-routed connection through the same
+// transport pipeline as keepAccepting: TLS/Reality handshake → auth → callback.
+// Uses the exact same cached config objects that were created at listener init.
+func (v *Listener) HandleConnection(conn net.Conn) error {
+	var err error
+	if v.tlsConfig != nil {
+		conn = tls.Server(conn, v.tlsConfig)
+	} else if v.realityConfig != nil {
+		if conn, err = reality.Server(conn, v.realityConfig); err != nil {
+			return err
+		}
+	}
+	if v.authConfig != nil {
+		conn = v.authConfig.Server(conn)
+	}
+	v.addConn(stat.Connection(conn))
+	return nil
+}
+
 // Addr implements internet.Listener.Addr.
 func (v *Listener) Addr() net.Addr {
 	return v.listener.Addr()

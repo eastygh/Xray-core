@@ -22,12 +22,6 @@ const (
 	defaultMinPeekSize = 16 // enough for TLS record header (5) + handshake type (1) + length (3) + version (2) + random start
 )
 
-// transportApplier is implemented by handlers that can apply their
-// transport-layer security (TLS/Reality) to an external connection.
-type transportApplier interface {
-	ApplyTransport(conn net.Conn) (net.Conn, error)
-}
-
 // compiledRule is a pre-compiled routing rule.
 type compiledRule struct {
 	match      string
@@ -117,25 +111,24 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 		return errors.New("selector: handler not found: ", handlerTag).Base(err)
 	}
 
+	// 5. Inject the raw connection into the handler's listener pipeline.
+	// The listener applies TLS/Reality using its own cached config objects,
+	// then passes the decrypted connection to the worker callback.
+	// Peeked bytes are still in the socket buffer — read natively.
+	type connectionInjector interface {
+		HandleConnection(net.Conn) bool
+	}
+	rawConn := unwrapRawConn(conn)
+	if ci, ok := handler.(connectionInjector); ok && ci.HandleConnection(rawConn) {
+		return nil // handler took ownership of the connection
+	}
+
+	// 6. Fallback: handler has no listener — delegate to proxy directly
 	gi, ok := handler.(proxy.GetInbound)
 	if !ok {
 		return errors.New("selector: handler [", handlerTag, "] does not expose proxy.Inbound")
 	}
-	inboundProxy := gi.GetInbound()
-
-	// 5. Let the handler apply its own transport security (TLS/Reality).
-	// The peeked bytes are still in the socket buffer — the transport
-	// layer reads them natively via normal Read().
-	processConn := unwrapRawConn(conn)
-	if ta, ok := handler.(transportApplier); ok {
-		processConn, err = ta.ApplyTransport(processConn)
-		if err != nil {
-			return errors.New("selector: transport handshake failed for handler [", handlerTag, "]").Base(err)
-		}
-	}
-
-	// 6. Delegate to target proxy
-	return inboundProxy.Process(ctx, network, stat.Connection(processConn), dispatcher)
+	return gi.GetInbound().Process(ctx, network, stat.Connection(rawConn), dispatcher)
 }
 
 // unwrapRawConn peels off stat.CounterConnection wrappers to get the raw

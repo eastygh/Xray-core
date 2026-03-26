@@ -15,8 +15,6 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/reality"
-	"github.com/xtls/xray-core/transport/internet/tls"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -209,20 +207,23 @@ func (h *AlwaysOnInboundHandler) ReceiverSettings() *serial.TypedMessage {
 	return serial.ToTypedMessage(h.receiverConfig)
 }
 
-// ApplyTransport wraps the connection with the handler's transport-layer
-// security (TLS/Reality) if configured. Uses the same MemoryStreamConfig
-// that was parsed at handler init time — no protobuf roundtrip.
-func (h *AlwaysOnInboundHandler) ApplyTransport(conn net.Conn) (net.Conn, error) {
-	if h.streamConfig == nil {
-		return conn, nil
+// HandleConnection injects an externally-routed connection into this handler's
+// listener pipeline. The connection goes through the exact same TLS/Reality
+// handshake and callback as connections accepted by the listener directly.
+// Returns false if no suitable listener was found (fallback to proxy.Process).
+func (h *AlwaysOnInboundHandler) HandleConnection(conn net.Conn) bool {
+	type connectionHandler interface {
+		HandleConnection(net.Conn) error
 	}
-	if tlsConfig := tls.ConfigFromStreamSettings(h.streamConfig); tlsConfig != nil {
-		return tls.Server(conn, tlsConfig.GetTLSConfig()), nil
+	for _, w := range h.workers {
+		if tw, ok := w.(*tcpWorker); ok && tw.hub != nil {
+			if ch, ok := tw.hub.(connectionHandler); ok {
+				ch.HandleConnection(conn)
+				return true
+			}
+		}
 	}
-	if realityConfig := reality.ConfigFromStreamSettings(h.streamConfig); realityConfig != nil {
-		return reality.Server(conn, realityConfig.GetREALITYConfig())
-	}
-	return conn, nil
+	return false
 }
 
 // ProxySettings implements inbound.Handler.
