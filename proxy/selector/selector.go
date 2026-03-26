@@ -1,13 +1,10 @@
 package selector
 
 import (
-	"bytes"
 	"context"
-	"fmt"
-	"io"
 	"net"
 	"regexp"
-	"sync"
+	"time"
 
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
@@ -17,10 +14,17 @@ import (
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
-const defaultReadSize = 2048
+const (
+	defaultReadSize    = 2048
+	defaultPeekTimeout = 5 * time.Second
+	defaultMinPeekSize = 16 // enough for TLS record header (5) + handshake type (1) + length (3) + version (2) + random start
+)
 
 // compiledRule is a pre-compiled routing rule.
 type compiledRule struct {
@@ -37,14 +41,25 @@ type Selector struct {
 	inboundManager inbound.Manager
 	rules          []compiledRule
 	readSize       int
+	peekTimeout    time.Duration
+	minPeekSize    int
 }
 
 func (s *Selector) init(config *Config, im inbound.Manager) error {
 	s.config = config
 	s.inboundManager = im
+
 	s.readSize = int(config.ReadSize)
 	if s.readSize <= 0 {
 		s.readSize = defaultReadSize
+	}
+	s.peekTimeout = time.Duration(config.PeekTimeoutMs) * time.Millisecond
+	if s.peekTimeout <= 0 {
+		s.peekTimeout = defaultPeekTimeout
+	}
+	s.minPeekSize = int(config.MinPeekSize)
+	if s.minPeekSize <= 0 {
+		s.minPeekSize = defaultMinPeekSize
 	}
 
 	s.rules = make([]compiledRule, 0, len(config.Rules))
@@ -72,13 +87,14 @@ func (s *Selector) Network() []xnet.Network {
 
 // Process implements proxy.Inbound.
 func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
-	// 1. Read first bytes
-	firstBuf := make([]byte, s.readSize)
-	n, err := conn.Read(firstBuf)
+	// 1. Peek at first bytes WITHOUT consuming them from the socket buffer.
+	// Uses MSG_PEEK so the original connection stays untouched, preserving
+	// all native interfaces (CloseWrite, SyscallConn, etc.) for TLS/Reality.
+	// Waits until at least minPeekSize bytes are available or timeout expires.
+	firstBytes, err := peekBytes(conn, s.readSize, s.minPeekSize, s.peekTimeout)
 	if err != nil {
-		return errors.New("failed to read first bytes").Base(err)
+		return errors.New("failed to peek first bytes").Base(err)
 	}
-	firstBytes := firstBuf[:n]
 
 	// 2. Detect protocol
 	result := Detect(firstBytes)
@@ -93,7 +109,8 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 	}
 
 	errors.LogInfo(ctx, "selector: routing to handler [", handlerTag, "]",
-		" tls=", result.IsTLS, " sni=", result.SNI, " ech=", result.HasECH, " mtproto=", result.IsMTProto)
+		" tls=", result.IsTLS, " sni=", result.SNI, " ech=", result.HasECH,
+		" mtproto=", result.IsMTProto, " peeked=", len(firstBytes))
 
 	// 4. Get target handler
 	handler, err := s.inboundManager.GetHandler(ctx, handlerTag)
@@ -101,102 +118,59 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 		return errors.New("selector: handler not found: ", handlerTag).Base(err)
 	}
 
-	// 5. Wrap connection to replay consumed bytes
-	wrappedConn := newBufferedConn(conn, firstBytes)
-
-	// 6. If the target handler has transport-layer security (TLS/Reality/etc.),
-	// we cannot call proxy.Process() directly because that bypasses the transport
-	// stack. Instead, pipe the raw connection to the handler's own listener so
-	// the native transport code handles TLS/Reality/WS/gRPC/etc.
-	if addr := getHandlerListenAddr(handler); addr != "" {
-		errors.LogInfo(ctx, "selector: piping to handler listener at ", addr)
-		return pipeToListener(wrappedConn, addr)
-	}
-
-	// 7. No transport security — delegate to proxy directly
 	gi, ok := handler.(proxy.GetInbound)
 	if !ok {
 		return errors.New("selector: handler [", handlerTag, "] does not expose proxy.Inbound")
 	}
-	return gi.GetInbound().Process(ctx, network, wrappedConn, dispatcher)
+	inboundProxy := gi.GetInbound()
+
+	// 5. If the target handler has transport-layer security (TLS/Reality),
+	// apply it to the original connection. The peeked bytes are still in the
+	// socket buffer, so the transport layer reads them natively.
+	processConn := unwrapRawConn(conn)
+	processConn, err = applyTransportSecurity(processConn, handler)
+	if err != nil {
+		return errors.New("selector: transport handshake failed for handler [", handlerTag, "]").Base(err)
+	}
+
+	// 6. Delegate to target proxy
+	return inboundProxy.Process(ctx, network, stat.Connection(processConn), dispatcher)
 }
 
-// getHandlerListenAddr returns "host:port" of the handler's listener if it has
-// transport-layer security configured. Returns "" if direct proxy.Process() is safe.
-func getHandlerListenAddr(handler inbound.Handler) string {
+// unwrapRawConn peels off stat.CounterConnection wrappers to get the raw
+// net.Conn (typically *net.TCPConn) with native interface support.
+func unwrapRawConn(conn stat.Connection) net.Conn {
+	return stat.TryUnwrapStatsConn(conn)
+}
+
+// applyTransportSecurity checks if the handler has TLS/Reality configured
+// in its stream settings and applies the server-side transport handshake.
+// For handlers without transport security, returns the connection unchanged.
+func applyTransportSecurity(conn net.Conn, handler inbound.Handler) (net.Conn, error) {
 	rs := handler.ReceiverSettings()
 	if rs == nil {
-		return ""
+		return conn, nil
 	}
 	msg, err := rs.GetInstance()
 	if err != nil {
-		return ""
+		return conn, nil
 	}
 	rc, ok := msg.(*proxyman.ReceiverConfig)
-	if !ok {
-		return ""
+	if !ok || rc.StreamSettings == nil || !rc.StreamSettings.HasSecuritySettings() {
+		return conn, nil
 	}
-
-	// Only pipe when there is transport security that the listener must handle
-	if rc.StreamSettings == nil || !rc.StreamSettings.HasSecuritySettings() {
-		return ""
-	}
-
-	// Need a port to connect to
-	if rc.PortList == nil || len(rc.PortList.Range) == 0 {
-		return ""
-	}
-	port := rc.PortList.Range[0].From
-
-	addr := "127.0.0.1"
-	if rc.Listen != nil {
-		if a := rc.Listen.AsAddress(); a != nil {
-			s := a.String()
-			// If handler listens on 0.0.0.0 or ::, connect via loopback
-			if s != "0.0.0.0" && s != "::" {
-				addr = s
-			}
-		}
-	}
-
-	return fmt.Sprintf("%s:%d", addr, port)
-}
-
-// pipeToListener connects to the handler's actual listener and bidirectionally
-// copies data. This lets the handler's full transport stack (TLS/Reality/WS/gRPC)
-// process the connection natively — the same approach used by VLESS fallbacks.
-func pipeToListener(clientConn stat.Connection, addr string) error {
-	targetConn, err := net.Dial("tcp", addr)
+	mss, err := internet.ToMemoryStreamConfig(rc.StreamSettings)
 	if err != nil {
-		return errors.New("selector: failed to connect to handler listener at ", addr).Base(err)
+		return conn, nil
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// client → handler listener
-	go func() {
-		io.Copy(targetConn, clientConn)
-		// Signal write-done to target so TLS knows the stream ended
-		if tc, ok := targetConn.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
-		wg.Done()
-	}()
-
-	// handler listener → client
-	go func() {
-		io.Copy(clientConn, targetConn)
-		// Signal write-done to client
-		if cw, ok := clientConn.(interface{ CloseWrite() error }); ok {
-			cw.CloseWrite()
-		}
-		wg.Done()
-	}()
-
-	wg.Wait()
-	targetConn.Close()
-	return nil
+	if tlsConfig := tls.ConfigFromStreamSettings(mss); tlsConfig != nil {
+		return tls.Server(conn, tlsConfig.GetTLSConfig()), nil
+	}
+	if realityConfig := reality.ConfigFromStreamSettings(mss); realityConfig != nil {
+		return reality.Server(conn, realityConfig.GetREALITYConfig())
+	}
+	return conn, nil
 }
 
 // matchRules finds the first matching rule for the detection result.
@@ -234,31 +208,6 @@ func (s *Selector) matchRules(result DetectionResult) string {
 		}
 	}
 	return ""
-}
-
-// bufferedConn wraps a net.Conn, prepending already-read bytes before the real connection.
-type bufferedConn struct {
-	net.Conn
-	reader io.Reader
-}
-
-func newBufferedConn(conn net.Conn, firstBytes []byte) stat.Connection {
-	return &bufferedConn{
-		Conn:   conn,
-		reader: io.MultiReader(bytes.NewReader(firstBytes), conn),
-	}
-}
-
-func (c *bufferedConn) Read(b []byte) (int, error) {
-	return c.reader.Read(b)
-}
-
-// CloseWrite delegates half-close to the underlying connection.
-func (c *bufferedConn) CloseWrite() error {
-	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
-	}
-	return c.Conn.Close()
 }
 
 func init() {

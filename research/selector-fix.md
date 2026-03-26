@@ -7,100 +7,114 @@
 ```
 proxy/selector: selector: routing to handler [inbound-444] tls=true sni= ech=false mtproto=false
 proxy/vless/inbound: firstLen = 24
-app/proxyman/inbound: connection ends > proxy/vless/inbound: invalid request from ... > proxy/vless/encoding: invalid request version
+connection ends > proxy/vless/inbound: invalid request from ... > proxy/vless/encoding: invalid request version
 ```
-
-VLESS получает "invalid request version". При этом на mtproto перенаправление работает нормально.
 
 ## Корневая причина
 
-### Нормальный поток данных (без selector)
+Selector вызывал `proxy.Process()` напрямую, **обходя транспортный уровень** (TLS/Reality), который в нормальном потоке выполняется в `keepAccepting()` TCP listener'а (`transport/internet/tcp/hub.go:116-128`).
+
+VLESS получал сырые TLS-данные (байт `0x16`) вместо расшифрованного VLESS-протокола (байт `0x00`).
+
+MTProto работал потому что у него нет TLS на транспорте — прямой `proxy.Process()` корректен.
+
+## Неудачные подходы
+
+**1. bufferedConn + tls.Server/reality.Server** — оборачивали прочитанные байты в `bufferedConn` (`io.MultiReader`), применяли TLS/Reality к обёртке. `bufferedConn` не реализует нативные интерфейсы Reality (`CloseWriteConn`, `SyscallConn`, splice), даже после добавления `CloseWrite()` — panic или невалидные данные.
+
+**2. Pipe к listener'у (loopback)** — `net.Dial("tcp", "127.0.0.1:port")` + двунаправленное копирование. Overhead, потеря client IP, требует listener на порту.
+
+## Решение: MSG_PEEK + нативное соединение
+
+### Идея
+
+`syscall.Recvfrom(fd, buf, MSG_PEEK)` подсматривает данные в socket buffer **без потребления**. Оригинальный `*net.TCPConn` передаётся в TLS/Reality transport нетронутым — все нативные интерфейсы работают.
 
 ```
-клиент → TCP listener → keepAccepting() → TLS/Reality handshake → decrypted conn → proxy.Process()
+клиент → selector → peekBytes(MSG_PEEK) → детекция протокола
+                     [данные ОСТАЮТСЯ в socket buffer]
+                                ↓
+         ┌──────────────────────┴──────────────────────┐
+         │ handler с TLS/Reality                       │ handler без transport security
+         │                                             │
+         │ unwrap CounterConnection → *net.TCPConn     │ unwrap → *net.TCPConn
+         │ tls.Server() / reality.Server()             │ proxy.Process() напрямую
+         │ transport читает байты из socket buffer      │ proxy читает из socket buffer
+         │ → TLS handshake → расшифрованные данные     │
+         │ → proxy.Process()                           │
+         └─────────────────────────────────────────────┘
 ```
 
-В `transport/internet/tcp/hub.go:116-128` при приёме соединения listener'ом:
-1. `tls.Server(conn, tlsConfig)` — если настроен TLS
-2. `reality.Server(conn, realityConfig)` — если настроен Reality
-3. Передаёт **расшифрованное** соединение в callback worker'а
-4. Worker вызывает `proxy.Process()` с уже расшифрованными данными
+### Параметры peek
 
-### Поток через selector (до исправления)
+| Параметр | Дефолт | Описание |
+|---|---|---|
+| `readSize` | 2048 | Макс размер peek буфера |
+| `minPeekSize` | 16 | Мин байт перед детекцией |
+| `peekTimeoutMs` | 5000 | Таймаут (мс) от зависших соединений |
 
-```
-клиент → selector.Process() → read first bytes → detect TLS →
-    bufferedConn(raw TLS data) → vless.Process() ← ОШИБКА: VLESS видит 0x16 вместо 0x00
-```
-
-Selector вызывал `inboundProxy.Process()` напрямую через `proxy.GetInbound`, **полностью обходя транспортный уровень** целевого handler'а.
-
-### Почему mtproto работал
-
-MTProto — протокол прикладного уровня без TLS на транспорте. Прямой вызов `proxy.Process()` работает корректно.
-
-### Почему нельзя просто применить TLS/Reality в selector
-
-Первый подход: реконструировать TLS/Reality конфиг из protobuf настроек handler'а и вызвать `tls.Server()` / `reality.Server()` в selector'е.
-
-**Проблемы этого подхода:**
-1. **Reality** имеет сложную внутреннюю логику (MirrorConn, dial to dest, DetectPostHandshakeRecordsLens) — реконструкция конфига из protobuf roundtrip может терять runtime-состояние
-2. **bufferedConn** не реализует все интерфейсы, которые ожидает Reality (`CloseWriteConn`, и потенциально другие через type assertion)
-3. **Не универсально** — нужно отдельно обрабатывать TLS, Reality, а также потенциально WebSocket, gRPC и другие транспорты
-4. Результат: handshake проходит, но расшифрованные данные невалидны (`firstLen = 24`, не VLESS)
-
-## Исправление: pipe к listener'у handler'а
-
-Файл: `proxy/selector/selector.go`
-
-Вместо прямого вызова `proxy.Process()` для handler'ов с transport security, selector теперь **перенаправляет сырое TCP-соединение на listener целевого handler'а**. Это тот же подход, который используют VLESS fallbacks.
-
-### Алгоритм
-
-```
-1. selector читает первые байты → определяет протокол (TLS/SNI/MTProto)
-2. Находит целевой handler по правилам
-3. Проверяет: есть ли у handler'а transport security (TLS/Reality)?
-
-   ДА → pipe на listener handler'а (handler сам выполнит TLS/Reality):
-       bufferedConn ←→ net.Dial("tcp", "127.0.0.1:port") ←→ handler listener
-
-   НЕТ → прямой вызов proxy.Process() (как раньше):
-       bufferedConn → proxy.Process()
+```json
+{
+  "protocol": "selector",
+  "settings": {
+    "readSize": 2048,
+    "minPeekSize": 16,
+    "peekTimeoutMs": 5000,
+    "rules": [...],
+    "defaultHandlerTag": "..."
+  }
+}
 ```
 
-### Ключевые функции
+### Механика peek
 
-**`getHandlerListenAddr(handler)`** — извлекает адрес listener'а из `ReceiverSettings`:
-- Декодирует `ReceiverConfig` из protobuf
-- Проверяет наличие `StreamSettings.HasSecuritySettings()`
-- Возвращает `"host:port"` или `""` если pipe не нужен
+1. `SetReadDeadline(now + timeout)` — ограничиваем ожидание
+2. Цикл `MSG_PEEK` — повторяем пока не наберётся `minPeekSize` байт
+3. Между попытками `5ms` пауза для прибытия данных в socket buffer
+4. Если таймаут но есть байты → partial detection (TLS type без SNI)
+5. `SetReadDeadline(zero)` — сбрасываем deadline после peek
 
-**`pipeToListener(clientConn, addr)`** — двунаправленное копирование:
-- `net.Dial("tcp", addr)` — подключение к listener'у handler'а
-- Два goroutine: `client→handler` и `handler→client`
-- `CloseWrite()` для корректного завершения TLS
+### Платформы
 
-### Исправленный поток
+Общая логика в `peek.go`, platform-specific только `recvfromPeek()` + `isRetryable()`:
 
+| Файл | Платформа | Отличие |
+|---|---|---|
+| `peek.go` | Все | Общая логика: deadline, retry loop, ошибки |
+| `peek_unix.go` | Linux, macOS, BSD | `Recvfrom(int(fd), MSG_PEEK)`, `EAGAIN`/`EWOULDBLOCK` |
+| `peek_windows.go` | Windows | `Recvfrom(Handle(fd), 0x2)`, `WSAEWOULDBLOCK` (10035) |
+
+### Применение transport security
+
+```go
+processConn := unwrapRawConn(conn)                          // CounterConnection → *net.TCPConn
+processConn, err = applyTransportSecurity(processConn, handler) // TLS/Reality если есть
+inboundProxy.Process(ctx, network, processConn, dispatcher)
 ```
-клиент → selector → detect TLS → pipe → handler listener → TLS handshake → proxy.Process() ✓
-клиент → selector → detect MTProto → direct proxy.Process() ✓
-```
 
-## Преимущества подхода
+`applyTransportSecurity()` проверяет `ReceiverSettings()` handler'а:
+- Есть TLS → `tls.Server(conn, config.GetTLSConfig())`
+- Есть Reality → `reality.Server(conn, config.GetREALITYConfig())`
+- Нет security → conn без изменений
 
-1. **Универсальность** — работает с любым транспортом (TLS, Reality, WebSocket, gRPC, etc.)
-2. **Надёжность** — используется тот же code path, что и при прямом подключении к handler'у
-3. **Малоинвазивность** — изменения только в `proxy/selector/selector.go`
-4. **Проверенный паттерн** — аналогичен VLESS fallbacks (`transport/internet/tcp/hub.go`)
+### Почему это работает
 
-## Ограничения
-
-1. **Overhead** — добавляется локальное TCP-соединение через loopback (минимальная задержка, ~50μs)
-2. **Client IP** — handler видит source IP как 127.0.0.1, а не IP клиента. Для сохранения IP можно в будущем добавить PROXY protocol
-3. **Требуется listener** — целевой handler должен слушать на порту. Если у handler'а нет порта, pipe невозможен (fallback на прямой proxy.Process)
+1. **MSG_PEEK** не потребляет данные — `Read()` вернёт те же байты
+2. **Оригинальный `*net.TCPConn`** — `CloseWrite`, `SyscallConn`, splice, sendfile
+3. **Reality** получает настоящий TCP-сокет → `MirrorConn`, type assertions, `io.Copy` работают
+4. **Универсально** — любой транспорт (TLS, Reality, plain TCP) без спецобработки
+5. **Zero-copy detection** — данные остаются в kernel buffer
 
 ## Изменённые файлы
 
-- `proxy/selector/selector.go` — pipe для handler'ов с transport security
+| Файл | Что изменено |
+|---|---|
+| `proxy/selector/selector.go` | Peek + apply transport + конфиг параметры |
+| `proxy/selector/peek.go` | **Новый.** Общая логика peek с retry и timeout |
+| `proxy/selector/peek_unix.go` | **Новый.** `recvfromPeek()` для Unix |
+| `proxy/selector/peek_windows.go` | **Новый.** `recvfromPeek()` для Windows |
+| `proxy/selector/config.proto` | Поля `peek_timeout_ms`, `min_peek_size` |
+| `proxy/selector/config.pb.go` | Соответствующие поля + getter'ы |
+| `infra/conf/selector.go` | JSON-поля `peekTimeoutMs`, `minPeekSize` |
+
+Основной код (handler'ы, worker'ы, transport layer) **не затронут**.

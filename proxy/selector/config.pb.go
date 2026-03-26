@@ -86,6 +86,8 @@ type Config struct {
 	Rules             []*Rule                `protobuf:"bytes,1,rep,name=rules,proto3" json:"rules,omitempty"`
 	DefaultHandlerTag string                 `protobuf:"bytes,2,opt,name=default_handler_tag,json=defaultHandlerTag,proto3" json:"default_handler_tag,omitempty"`
 	ReadSize          int32                  `protobuf:"varint,3,opt,name=read_size,json=readSize,proto3" json:"read_size,omitempty"`
+	PeekTimeoutMs     int32                  `protobuf:"varint,4,opt,name=peek_timeout_ms,json=peekTimeoutMs,proto3" json:"peek_timeout_ms,omitempty"`
+	MinPeekSize       int32                  `protobuf:"varint,5,opt,name=min_peek_size,json=minPeekSize,proto3" json:"min_peek_size,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -137,6 +139,20 @@ func (x *Config) GetDefaultHandlerTag() string {
 func (x *Config) GetReadSize() int32 {
 	if x != nil {
 		return x.ReadSize
+	}
+	return 0
+}
+
+func (x *Config) GetPeekTimeoutMs() int32 {
+	if x != nil {
+		return x.PeekTimeoutMs
+	}
+	return 0
+}
+
+func (x *Config) GetMinPeekSize() int32 {
+	if x != nil {
+		return x.MinPeekSize
 	}
 	return 0
 }

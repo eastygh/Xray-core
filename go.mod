@@ -3,7 +3,7 @@ module github.com/xtls/xray-core
 go 1.26
 
 require (
-	github.com/9seconds/mtg/v2 v2.2.3
+	github.com/9seconds/mtg/v2 v2.2.4
 	github.com/apernet/quic-go v0.59.1-0.20260217092621-db4786c77a22
 	github.com/cloudflare/circl v1.6.3
 	github.com/ghodss/yaml v1.0.1-0.20220118164431-d8423dcdf344
@@ -42,7 +42,7 @@ require (
 	github.com/google/btree v1.1.2 // indirect
 	github.com/juju/ratelimit v1.0.2 // indirect
 	github.com/klauspost/compress v1.18.3 // indirect
-	github.com/panjf2000/ants/v2 v2.11.6 // indirect
+	github.com/panjf2000/ants/v2 v2.12.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/tylertreat/BoomFilters v0.0.0-20251117164519-53813c36cc1b // indirect

@@ -15,12 +15,16 @@ type SelectorConfig struct {
 	Rules             []*SelectorRule `json:"rules"`
 	DefaultHandlerTag string          `json:"defaultHandlerTag"`
 	ReadSize          int32           `json:"readSize"`
+	PeekTimeoutMs     int32           `json:"peekTimeoutMs"`
+	MinPeekSize       int32           `json:"minPeekSize"`
 }
 
 func (c *SelectorConfig) Build() (proto.Message, error) {
 	config := &selector.Config{
 		DefaultHandlerTag: c.DefaultHandlerTag,
 		ReadSize:          c.ReadSize,
+		PeekTimeoutMs:     c.PeekTimeoutMs,
+		MinPeekSize:       c.MinPeekSize,
 	}
 
 	config.Rules = make([]*selector.Rule, len(c.Rules))

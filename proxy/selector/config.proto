@@ -15,5 +15,7 @@ message Rule {
 message Config {
   repeated Rule rules = 1;
   string default_handler_tag = 2;
-  int32 read_size = 3;
+  int32 read_size = 3;        // Max peek buffer size in bytes (default 2048)
+  int32 peek_timeout_ms = 4;  // Peek timeout in milliseconds (default 5000)
+  int32 min_peek_size = 5;    // Min bytes before detection proceeds (default 16)
 }
