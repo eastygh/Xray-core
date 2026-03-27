@@ -111,30 +111,23 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 		return errors.New("selector: handler not found: ", handlerTag).Base(err)
 	}
 
-	// 5. Inject the raw connection into the handler's listener pipeline.
-	// The listener applies TLS/Reality using its own cached config objects,
-	// then the worker callback runs synchronously with proper context.
-	type connectionInjector interface {
-		HandleConnection(net.Conn) bool
+	// 5. Delegate to the target handler's full pipeline:
+	// transport (TLS/Reality) → proper context → proxy.Process.
+	// The handler builds its own context (tag, sniffing, session) —
+	// we do NOT pass the selector's context.
+	type connectionHandler interface {
+		HandleConnection(net.Conn) error
 	}
 	rawConn := unwrapRawConn(conn)
-	if ci, ok := handler.(connectionInjector); ok {
-		errors.LogInfo(ctx, "selector: handler [", handlerTag, "] supports HandleConnection, injecting")
-		if ci.HandleConnection(rawConn) {
-			return nil // handler took ownership — ran synchronously to completion
-		}
-		errors.LogWarning(ctx, "selector: handler [", handlerTag, "] HandleConnection returned false (no worker/listener?)")
-	} else {
-		errors.LogWarning(ctx, "selector: handler [", handlerTag, "] does not support HandleConnection, using fallback")
+	if ch, ok := handler.(connectionHandler); ok {
+		return ch.HandleConnection(rawConn)
 	}
 
-	// 6. Fallback: handler has no listener — delegate to proxy directly.
-	// NOTE: ctx here is the selector's context, not the target handler's.
+	// Fallback for handlers that don't implement HandleConnection
 	gi, ok := handler.(proxy.GetInbound)
 	if !ok {
-		return errors.New("selector: handler [", handlerTag, "] does not expose proxy.Inbound")
+		return errors.New("selector: handler [", handlerTag, "] cannot handle connections")
 	}
-	errors.LogWarning(ctx, "selector: fallback direct proxy.Process for [", handlerTag, "] — TLS will NOT be applied")
 	return gi.GetInbound().Process(ctx, network, stat.Connection(rawConn), dispatcher)
 }
 
