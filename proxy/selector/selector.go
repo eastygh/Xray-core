@@ -113,21 +113,28 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 
 	// 5. Inject the raw connection into the handler's listener pipeline.
 	// The listener applies TLS/Reality using its own cached config objects,
-	// then passes the decrypted connection to the worker callback.
-	// Peeked bytes are still in the socket buffer — read natively.
+	// then the worker callback runs synchronously with proper context.
 	type connectionInjector interface {
 		HandleConnection(net.Conn) bool
 	}
 	rawConn := unwrapRawConn(conn)
-	if ci, ok := handler.(connectionInjector); ok && ci.HandleConnection(rawConn) {
-		return nil // handler took ownership of the connection
+	if ci, ok := handler.(connectionInjector); ok {
+		errors.LogInfo(ctx, "selector: handler [", handlerTag, "] supports HandleConnection, injecting")
+		if ci.HandleConnection(rawConn) {
+			return nil // handler took ownership — ran synchronously to completion
+		}
+		errors.LogWarning(ctx, "selector: handler [", handlerTag, "] HandleConnection returned false (no worker/listener?)")
+	} else {
+		errors.LogWarning(ctx, "selector: handler [", handlerTag, "] does not support HandleConnection, using fallback")
 	}
 
-	// 6. Fallback: handler has no listener — delegate to proxy directly
+	// 6. Fallback: handler has no listener — delegate to proxy directly.
+	// NOTE: ctx here is the selector's context, not the target handler's.
 	gi, ok := handler.(proxy.GetInbound)
 	if !ok {
 		return errors.New("selector: handler [", handlerTag, "] does not expose proxy.Inbound")
 	}
+	errors.LogWarning(ctx, "selector: fallback direct proxy.Process for [", handlerTag, "] — TLS will NOT be applied")
 	return gi.GetInbound().Process(ctx, network, stat.Connection(rawConn), dispatcher)
 }
 
