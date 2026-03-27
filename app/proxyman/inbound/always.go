@@ -15,6 +15,7 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/stat"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -208,17 +209,24 @@ func (h *AlwaysOnInboundHandler) ReceiverSettings() *serial.TypedMessage {
 }
 
 // HandleConnection injects an externally-routed connection into this handler's
-// listener pipeline. The connection goes through the exact same TLS/Reality
-// handshake and callback as connections accepted by the listener directly.
+// pipeline. The listener applies TLS/Reality using its own cached config,
+// then the worker callback runs SYNCHRONOUSLY (blocks until proxy finishes).
 // Returns false if no suitable listener was found (fallback to proxy.Process).
 func (h *AlwaysOnInboundHandler) HandleConnection(conn net.Conn) bool {
-	type connectionHandler interface {
-		HandleConnection(net.Conn) error
+	type transportApplier interface {
+		ApplyTransport(net.Conn) (net.Conn, error)
 	}
 	for _, w := range h.workers {
 		if tw, ok := w.(*tcpWorker); ok && tw.hub != nil {
-			if ch, ok := tw.hub.(connectionHandler); ok {
-				ch.HandleConnection(conn)
+			if ta, ok := tw.hub.(transportApplier); ok {
+				wrapped, err := ta.ApplyTransport(conn)
+				if err != nil {
+					return true // connection handled (transport failed)
+				}
+				// Call callback synchronously — blocks until the proxy is done.
+				// This prevents the selector's worker from closing the connection
+				// while the target handler is still processing it.
+				tw.callback(stat.Connection(wrapped))
 				return true
 			}
 		}
