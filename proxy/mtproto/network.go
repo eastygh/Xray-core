@@ -14,6 +14,7 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 )
 
+// xrayNetwork implements mtglib.Network using xray's dispatcher for outbound connections.
 type xrayNetwork struct {
 	dispatcher routing.Dispatcher
 	mu         sync.Mutex
@@ -45,12 +46,10 @@ func (n *xrayNetwork) Dial(network, address string) (essentials.Conn, error) {
 	return n.DialContext(context.Background(), network, address)
 }
 
-func (n *xrayNetwork) DialContext(ctx context.Context, network, address string) (essentials.Conn, error) {
+func (n *xrayNetwork) DialContext(_ context.Context, network, address string) (essentials.Conn, error) {
 	dest := parseDestination(network, address)
 
-	dispCtx := n.getContext()
-
-	link, err := n.dispatcher.Dispatch(dispCtx, dest)
+	link, err := n.dispatcher.Dispatch(n.getContext(), dest)
 	if err != nil {
 		return nil, err
 	}
@@ -91,19 +90,17 @@ func parseDestination(network, address string) xnet.Destination {
 
 	port, _ := strconv.Atoi(portStr)
 
-	var xnetwork xnet.Network
+	var proto xnet.Network
 	switch network {
 	case "udp", "udp4", "udp6":
-		xnetwork = xnet.Network_UDP
+		proto = xnet.Network_UDP
 	default:
-		xnetwork = xnet.Network_TCP
+		proto = xnet.Network_TCP
 	}
 
-	addr := xnet.ParseAddress(host)
-
 	return xnet.Destination{
-		Network: xnetwork,
-		Address: addr,
+		Network: proto,
+		Address: xnet.ParseAddress(host),
 		Port:    xnet.Port(port),
 	}
 }

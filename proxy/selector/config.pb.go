@@ -26,6 +26,8 @@ type Rule struct {
 	Match         string                 `protobuf:"bytes,1,opt,name=match,proto3" json:"match,omitempty"`
 	Pattern       string                 `protobuf:"bytes,2,opt,name=pattern,proto3" json:"pattern,omitempty"`
 	HandlerTag    string                 `protobuf:"bytes,3,opt,name=handler_tag,json=handlerTag,proto3" json:"handler_tag,omitempty"`
+	LoopbackAddr  string                 `protobuf:"bytes,4,opt,name=loopback_addr,json=loopbackAddr,proto3" json:"loopback_addr,omitempty"`     // e.g. "127.0.0.1:10001"; if empty, resolved from handler's receiver config
+	ProxyProtocol uint32                 `protobuf:"varint,5,opt,name=proxy_protocol,json=proxyProtocol,proto3" json:"proxy_protocol,omitempty"` // 0 = off, 1 = PROXY protocol v1, 2 = PROXY protocol v2
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -81,13 +83,27 @@ func (x *Rule) GetHandlerTag() string {
 	return ""
 }
 
+func (x *Rule) GetLoopbackAddr() string {
+	if x != nil {
+		return x.LoopbackAddr
+	}
+	return ""
+}
+
+func (x *Rule) GetProxyProtocol() uint32 {
+	if x != nil {
+		return x.ProxyProtocol
+	}
+	return 0
+}
+
 type Config struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	Rules             []*Rule                `protobuf:"bytes,1,rep,name=rules,proto3" json:"rules,omitempty"`
 	DefaultHandlerTag string                 `protobuf:"bytes,2,opt,name=default_handler_tag,json=defaultHandlerTag,proto3" json:"default_handler_tag,omitempty"`
-	ReadSize          int32                  `protobuf:"varint,3,opt,name=read_size,json=readSize,proto3" json:"read_size,omitempty"`
-	PeekTimeoutMs     int32                  `protobuf:"varint,4,opt,name=peek_timeout_ms,json=peekTimeoutMs,proto3" json:"peek_timeout_ms,omitempty"`
-	MinPeekSize       int32                  `protobuf:"varint,5,opt,name=min_peek_size,json=minPeekSize,proto3" json:"min_peek_size,omitempty"`
+	ReadSize          int32                  `protobuf:"varint,3,opt,name=read_size,json=readSize,proto3" json:"read_size,omitempty"`                  // Max peek buffer size in bytes (default 2048)
+	PeekTimeoutMs     int32                  `protobuf:"varint,4,opt,name=peek_timeout_ms,json=peekTimeoutMs,proto3" json:"peek_timeout_ms,omitempty"` // Peek timeout in milliseconds (default 5000)
+	MinPeekSize       int32                  `protobuf:"varint,5,opt,name=min_peek_size,json=minPeekSize,proto3" json:"min_peek_size,omitempty"`       // Min bytes before detection proceeds (default 16)
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -161,16 +177,20 @@ var File_proxy_selector_config_proto protoreflect.FileDescriptor
 
 const file_proxy_selector_config_proto_rawDesc = "" +
 	"\n" +
-	"\x1bproxy/selector/config.proto\x12\x13xray.proxy.selector\"W\n" +
+	"\x1bproxy/selector/config.proto\x12\x13xray.proxy.selector\"\xa3\x01\n" +
 	"\x04Rule\x12\x14\n" +
 	"\x05match\x18\x01 \x01(\tR\x05match\x12\x18\n" +
 	"\apattern\x18\x02 \x01(\tR\apattern\x12\x1f\n" +
 	"\vhandler_tag\x18\x03 \x01(\tR\n" +
-	"handlerTag\"\x86\x01\n" +
+	"handlerTag\x12#\n" +
+	"\rloopback_addr\x18\x04 \x01(\tR\floopbackAddr\x12%\n" +
+	"\x0eproxy_protocol\x18\x05 \x01(\rR\rproxyProtocol\"\xd2\x01\n" +
 	"\x06Config\x12/\n" +
 	"\x05rules\x18\x01 \x03(\v2\x19.xray.proxy.selector.RuleR\x05rules\x12.\n" +
 	"\x13default_handler_tag\x18\x02 \x01(\tR\x11defaultHandlerTag\x12\x1b\n" +
-	"\tread_size\x18\x03 \x01(\x05R\breadSizeB[\n" +
+	"\tread_size\x18\x03 \x01(\x05R\breadSize\x12&\n" +
+	"\x0fpeek_timeout_ms\x18\x04 \x01(\x05R\rpeekTimeoutMs\x12\"\n" +
+	"\rmin_peek_size\x18\x05 \x01(\x05R\vminPeekSizeB[\n" +
 	"\x17com.xray.proxy.selectorP\x01Z(github.com/xtls/xray-core/proxy/selector\xaa\x02\x13Xray.Proxy.Selectorb\x06proto3"
 
 var (

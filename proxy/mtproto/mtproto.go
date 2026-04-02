@@ -28,23 +28,19 @@ func init() {
 	}))
 }
 
+// Handler implements proxy.Inbound for the MTProto protocol using mtglib.
 type Handler struct {
-	config  *Config
 	proxy   *mtglib.Proxy
 	xrayNet *xrayNetwork
 }
 
 func (h *Handler) init(config *Config, dispatcher routing.Dispatcher) error {
-	h.config = config
-
 	secret, err := mtglib.ParseSecret(config.Secret)
 	if err != nil {
-		return errors.New("failed to parse mtproto secret").Base(err)
+		return errors.New("failed to parse secret").Base(err)
 	}
 
-	h.xrayNet = &xrayNetwork{
-		dispatcher: dispatcher,
-	}
+	h.xrayNet = &xrayNetwork{dispatcher: dispatcher}
 
 	var antiReplayCache mtglib.AntiReplayCache
 	if config.AntiReplay {
@@ -76,40 +72,42 @@ func (h *Handler) init(config *Config, dispatcher routing.Dispatcher) error {
 		preferIP = mtglib.DefaultPreferIP
 	}
 
-	opts := mtglib.ProxyOpts{
+	proxy, err := mtglib.NewProxy(mtglib.ProxyOpts{
 		Secret:                   secret,
 		Network:                  h.xrayNet,
 		AntiReplayCache:          antiReplayCache,
 		IPBlocklist:              ipblocklist.NewNoop(),
 		IPAllowlist:              ipblocklist.NewNoop(),
 		EventStream:              events.NewNoopStream(),
-		Logger:                   newXrayLogger(),
+		Logger:                   newLogger(),
 		Concurrency:              concurrency,
 		TolerateTimeSkewness:     tolerateSkew,
 		DomainFrontingPort:       domainFrontingPort,
 		PreferIP:                 preferIP,
 		AllowFallbackOnUnknownDC: config.AllowFallbackOnUnknownDc,
 		AutoUpdate:               config.AutoUpdate,
-	}
-
-	proxy, err := mtglib.NewProxy(opts)
+	})
 	if err != nil {
-		return errors.New("failed to create mtproto proxy").Base(err)
+		return errors.New("failed to create proxy").Base(err)
 	}
 
 	h.proxy = proxy
 	return nil
 }
 
+// Network implements proxy.Inbound.
 func (h *Handler) Network() []net.Network {
 	return []net.Network{net.Network_TCP}
 }
 
+// Process implements proxy.Inbound.
 func (h *Handler) Process(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
-	inbound := session.InboundFromContext(ctx)
-	if inbound != nil {
-		inbound.Name = "mtproto"
+	if ib := session.InboundFromContext(ctx); ib != nil {
+		ib.Name = "mtproto"
+		ib.CanSpliceCopy = 3
 	}
+
+	errors.LogInfo(ctx, "received connection from ", conn.RemoteAddr())
 
 	h.xrayNet.setContext(ctx)
 	defer h.xrayNet.clearContext()

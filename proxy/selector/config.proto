@@ -10,6 +10,8 @@ message Rule {
   string match = 1;
   string pattern = 2;
   string handler_tag = 3;
+  string loopback_addr = 4;    // e.g. "127.0.0.1:10001"; if empty, resolved from handler's receiver config
+  uint32 proxy_protocol = 5;   // 0 = off, 1 = PROXY protocol v1, 2 = PROXY protocol v2
 }
 
 message Config {

@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 )
 
-// DetectionResult holds the result of protocol detection on the first bytes of a connection.
+// DetectionResult holds protocol detection results.
 type DetectionResult struct {
 	IsTLS     bool
 	HasECH    bool
@@ -12,7 +12,7 @@ type DetectionResult struct {
 	IsMTProto bool
 }
 
-// Detect analyzes the first bytes of a connection and returns a DetectionResult.
+// Detect analyzes first bytes of a connection to identify the protocol.
 func Detect(data []byte) DetectionResult {
 	var result DetectionResult
 
@@ -20,20 +20,19 @@ func Detect(data []byte) DetectionResult {
 		return result
 	}
 
-	// Check TLS: content type 0x16 (Handshake), valid version (3.x)
+	// TLS: content type 0x16 (Handshake), version 3.x
 	if len(data) >= 5 && data[0] == 0x16 && data[1] == 3 {
 		result.IsTLS = true
 		headerLen := int(binary.BigEndian.Uint16(data[3:5]))
 		if 5+headerLen <= len(data) {
 			result.SNI, result.HasECH = parseClientHello(data[5 : 5+headerLen])
 		} else if len(data) > 5 {
-			// Partial ClientHello — parse what we have
 			result.SNI, result.HasECH = parseClientHello(data[5:])
 		}
 		return result
 	}
 
-	// Check MTProto (heuristic): not TLS, not HTTP, >= 64 bytes, high entropy
+	// MTProto: not TLS, not HTTP, 64+ random-looking bytes
 	if len(data) >= 64 && !isHTTPMethod(data) && looksLikeMTProto(data) {
 		result.IsMTProto = true
 		return result
@@ -42,20 +41,12 @@ func Detect(data []byte) DetectionResult {
 	return result
 }
 
-// parseClientHello extracts SNI and detects ECH extension from a TLS ClientHello message.
-// Based on common/protocol/tls/sniff.go but extended for ECH detection.
+// parseClientHello extracts SNI and detects ECH from a TLS ClientHello.
 func parseClientHello(data []byte) (sni string, hasECH bool) {
-	if len(data) < 42 {
+	if len(data) < 42 || data[0] != 1 {
 		return
 	}
 
-	// data[0] = handshake type (1 = ClientHello)
-	if data[0] != 1 {
-		return
-	}
-
-	// Skip handshake header (4 bytes: type + length)
-	// Skip client version (2 bytes) + random (32 bytes) = starts at offset 38
 	if len(data) < 43 {
 		return
 	}
@@ -70,7 +61,6 @@ func parseClientHello(data []byte) (sni string, hasECH bool) {
 		return
 	}
 
-	// Cipher suites
 	cipherSuiteLen := int(data[0])<<8 | int(data[1])
 	if cipherSuiteLen%2 == 1 || len(data) < 2+cipherSuiteLen {
 		return
@@ -81,47 +71,44 @@ func parseClientHello(data []byte) (sni string, hasECH bool) {
 		return
 	}
 
-	// Compression methods
-	compressionMethodsLen := int(data[0])
-	if len(data) < 1+compressionMethodsLen {
+	compressionLen := int(data[0])
+	if len(data) < 1+compressionLen {
 		return
 	}
-	data = data[1+compressionMethodsLen:]
+	data = data[1+compressionLen:]
 
 	if len(data) < 2 {
 		return
 	}
 
-	// Extensions
-	extensionsLength := int(data[0])<<8 | int(data[1])
+	extLen := int(data[0])<<8 | int(data[1])
 	data = data[2:]
-	if extensionsLength > len(data) {
-		extensionsLength = len(data)
+	if extLen > len(data) {
+		extLen = len(data)
 	}
-	data = data[:extensionsLength]
+	data = data[:extLen]
 
 	for len(data) >= 4 {
 		extType := uint16(data[0])<<8 | uint16(data[1])
-		extLen := int(data[2])<<8 | int(data[3])
+		extDataLen := int(data[2])<<8 | int(data[3])
 		data = data[4:]
-		if extLen > len(data) {
+		if extDataLen > len(data) {
 			break
 		}
 
 		switch extType {
-		case 0x0000: // server_name (SNI)
-			sni = parseSNI(data[:extLen])
-		case 0xfe0d: // encrypted_client_hello (ECH)
+		case 0x0000: // server_name
+			sni = parseSNI(data[:extDataLen])
+		case 0xfe0d: // encrypted_client_hello
 			hasECH = true
 		}
 
-		data = data[extLen:]
+		data = data[extDataLen:]
 	}
 
 	return
 }
 
-// parseSNI extracts the hostname from a server_name extension.
 func parseSNI(data []byte) string {
 	if len(data) < 2 {
 		return ""
@@ -140,7 +127,7 @@ func parseSNI(data []byte) string {
 		if nameLen > len(data) {
 			break
 		}
-		if nameType == 0 { // host_name
+		if nameType == 0 {
 			return string(data[:nameLen])
 		}
 		data = data[nameLen:]
@@ -148,12 +135,10 @@ func parseSNI(data []byte) string {
 	return ""
 }
 
-// isHTTPMethod checks if data starts with a common HTTP method.
 func isHTTPMethod(data []byte) bool {
 	if len(data) < 3 {
 		return false
 	}
-	// Check common HTTP methods
 	switch {
 	case len(data) >= 3 && string(data[:3]) == "GET":
 		return true
@@ -175,18 +160,15 @@ func isHTTPMethod(data []byte) bool {
 	return false
 }
 
-// looksLikeMTProto uses heuristics to detect MTProto obfuscated protocol.
-// MTProto obfs2 sends 64 random-looking bytes as the initial handshake.
+// looksLikeMTProto uses heuristics to detect MTProto obfuscated handshake:
+// 64 bytes of high-entropy data, no known protocol signature.
 func looksLikeMTProto(data []byte) bool {
 	if len(data) < 64 {
 		return false
 	}
 
-	// Check that the first 56 bytes look random (high entropy).
-	// Random data should not have many null bytes or long runs of the same byte.
-	var nullCount int
-	var maxRun int
-	currentRun := 1
+	var nullCount, maxRun, currentRun int
+	currentRun = 1
 
 	for i := range 56 {
 		if data[i] == 0 {
@@ -202,17 +184,11 @@ func looksLikeMTProto(data []byte) bool {
 		}
 	}
 
-	// Reject if too many null bytes or repeating patterns
-	if nullCount > 8 {
-		return false
-	}
-	if maxRun > 6 {
+	if nullCount > 8 || maxRun > 6 {
 		return false
 	}
 
-	// MTProto header should not start with known protocol signatures
-	// Already checked: not TLS (0x16), not HTTP methods
-	// Additional check: not SOCKS5 (0x05), not SOCKS4 (0x04)
+	// Not SOCKS4/5
 	if data[0] == 0x05 || data[0] == 0x04 {
 		return false
 	}

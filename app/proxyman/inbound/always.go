@@ -15,9 +15,6 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/reality"
-	"github.com/xtls/xray-core/transport/internet/stat"
-	"github.com/xtls/xray-core/transport/internet/tls"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -53,7 +50,6 @@ type AlwaysOnInboundHandler struct {
 	workers        []worker
 	mux            *mux.Server
 	tag            string
-	streamConfig   *internet.MemoryStreamConfig
 }
 
 func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *proxyman.ReceiverConfig, proxyConfig interface{}) (*AlwaysOnInboundHandler, error) {
@@ -101,8 +97,6 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 	if err != nil {
 		return nil, errors.New("failed to parse stream config").Base(err).AtWarning()
 	}
-	h.streamConfig = mss
-
 	if receiverConfig.ReceiveOriginalDestination {
 		if mss.SocketSettings == nil {
 			mss.SocketSettings = &internet.SocketConfig{}
@@ -130,22 +124,6 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 			h.workers = append(h.workers, worker)
 		}
 
-		// Create a virtual tcpWorker (no port, no listener) so external
-		// routing (e.g., from selector) can reuse the standard callback
-		// pipeline: context setup → counters → proxy.Process.
-		if net.HasNetwork(nl, net.Network_TCP) {
-			h.workers = append(h.workers, &tcpWorker{
-				address:         address,
-				proxy:           p,
-				stream:          mss,
-				tag:             tag,
-				dispatcher:      h.mux,
-				sniffingConfig:  receiverConfig.SniffingSettings,
-				uplinkCounter:   uplinkCounter,
-				downlinkCounter: downlinkCounter,
-				ctx:             ctx,
-			})
-		}
 	}
 	if pl != nil {
 		for _, pr := range pl.Range {
@@ -225,38 +203,6 @@ func (h *AlwaysOnInboundHandler) GetInbound() proxy.Inbound {
 // ReceiverSettings implements inbound.Handler.
 func (h *AlwaysOnInboundHandler) ReceiverSettings() *serial.TypedMessage {
 	return serial.ToTypedMessage(h.receiverConfig)
-}
-
-// HandleConnection processes an externally-routed connection through the
-// handler's standard tcpWorker callback pipeline. Applies transport security
-// (TLS/Reality) from the handler's stream config, then delegates to the
-// worker's callback which handles context setup, counters, and proxy.Process.
-// Works for any protocol (VLESS, Shadowsocks, Trojan, etc.).
-// Blocks until the proxy finishes processing.
-func (h *AlwaysOnInboundHandler) HandleConnection(conn net.Conn) error {
-	// 1. Apply transport-layer security from the handler's cached stream config.
-	// This is the same logic as tcp.Listener.keepAccepting().
-	if h.streamConfig != nil {
-		if tlsConfig := tls.ConfigFromStreamSettings(h.streamConfig); tlsConfig != nil {
-			conn = tls.Server(conn, tlsConfig.GetTLSConfig())
-		} else if realityConfig := reality.ConfigFromStreamSettings(h.streamConfig); realityConfig != nil {
-			var err error
-			if conn, err = reality.Server(conn, realityConfig.GetREALITYConfig()); err != nil {
-				return err
-			}
-		}
-	}
-
-	// 2. Find the tcpWorker and reuse its callback — no code duplication.
-	// The callback builds proper context (tag, sniffing, counters, session)
-	// and calls proxy.Process synchronously.
-	for _, w := range h.workers {
-		if tw, ok := w.(*tcpWorker); ok {
-			tw.callback(stat.Connection(conn))
-			return nil
-		}
-	}
-	return errors.New("no TCP worker available for handler [", h.tag, "]")
 }
 
 // ProxySettings implements inbound.Handler.

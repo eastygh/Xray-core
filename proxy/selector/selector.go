@@ -2,13 +2,16 @@ package selector
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"regexp"
 	"time"
 
+	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/routing"
@@ -16,22 +19,33 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
+func init() {
+	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		s := new(Selector)
+		err := core.RequireFeatures(ctx, func(im inbound.Manager) error {
+			return s.init(config.(*Config), im)
+		})
+		return s, err
+	}))
+}
+
 const (
 	defaultReadSize    = 2048
 	defaultPeekTimeout = 5 * time.Second
-	defaultMinPeekSize = 16 // enough for TLS record header (5) + handshake type (1) + length (3) + version (2) + random start
+	defaultMinPeekSize = 16
 )
 
-// compiledRule is a pre-compiled routing rule.
 type compiledRule struct {
-	match      string
-	pattern    *regexp.Regexp
-	handlerTag string
+	match         string
+	pattern       *regexp.Regexp
+	handlerTag    string
+	loopbackAddr  string // non-empty when handler requires loopback relay
+	proxyProtocol uint32
 }
 
-// Selector implements proxy.Inbound. It reads the first bytes of a connection,
-// detects the protocol (TLS/SNI/ECH/MTProto), and delegates to the appropriate
-// inbound handler looked up by tag.
+// Selector implements proxy.Inbound.
+// It peeks at the first bytes of a TCP connection to detect the protocol,
+// then routes to the appropriate inbound handler by tag.
 type Selector struct {
 	config         *Config
 	inboundManager inbound.Manager
@@ -61,15 +75,25 @@ func (s *Selector) init(config *Config, im inbound.Manager) error {
 	s.rules = make([]compiledRule, 0, len(config.Rules))
 	for _, r := range config.Rules {
 		cr := compiledRule{
-			match:      r.Match,
-			handlerTag: r.HandlerTag,
+			match:         r.Match,
+			handlerTag:    r.HandlerTag,
+			proxyProtocol: r.ProxyProtocol,
 		}
 		if r.Pattern != "" {
 			re, err := regexp.Compile(r.Pattern)
 			if err != nil {
-				return errors.New("invalid regex pattern in selector rule: ", r.Pattern).Base(err)
+				return errors.New("invalid regex in rule: ", r.Pattern).Base(err)
 			}
 			cr.pattern = re
+		}
+		// Determine loopback address.
+		// Loopback is required when the target handler has transport security
+		// (TLS/Reality) — the connection must go through the handler's TCP
+		// listener so TLS handshake happens normally.
+		if r.LoopbackAddr != "" {
+			cr.loopbackAddr = r.LoopbackAddr
+		} else if addr, hasSecurity := resolveLoopbackAddr(im, cr.handlerTag); hasSecurity {
+			cr.loopbackAddr = addr
 		}
 		s.rules = append(s.rules, cr)
 	}
@@ -83,103 +107,132 @@ func (s *Selector) Network() []xnet.Network {
 
 // Process implements proxy.Inbound.
 func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
-	// 1. Peek at first bytes WITHOUT consuming them from the socket buffer.
 	firstBytes, err := peekBytes(conn, s.readSize, s.minPeekSize, s.peekTimeout)
 	if err != nil {
 		return errors.New("failed to peek first bytes").Base(err)
 	}
 
-	// 2. Detect protocol
 	result := Detect(firstBytes)
+	rule := s.matchRules(result)
 
-	// 3. Match rules
-	handlerTag := s.matchRules(result)
-	if handlerTag == "" {
-		handlerTag = s.config.DefaultHandlerTag
+	if rule == nil {
+		if s.config.DefaultHandlerTag == "" {
+			return errors.New("no matching rule and no default handler")
+		}
+		// Build a default rule on demand. Resolve loopback only if needed.
+		rule = &compiledRule{
+			match:      "default",
+			handlerTag: s.config.DefaultHandlerTag,
+		}
+		if addr, hasSecurity := resolveLoopbackAddr(s.inboundManager, rule.handlerTag); hasSecurity {
+			rule.loopbackAddr = addr
+		}
 	}
-	if handlerTag == "" {
-		return errors.New("no matching rule and no default handler configured")
-	}
 
-	errors.LogInfo(ctx, "selector: routing to handler [", handlerTag, "]",
-		" tls=", result.IsTLS, " sni=", result.SNI, " ech=", result.HasECH,
-		" mtproto=", result.IsMTProto, " peeked=", len(firstBytes))
+	useLoopback := rule.loopbackAddr != ""
 
-	// 4. Get target handler
-	handler, err := s.inboundManager.GetHandler(ctx, handlerTag)
+	errors.LogInfo(ctx, "routing to [", rule.handlerTag, "] tls=", result.IsTLS,
+		" sni=", result.SNI, " ech=", result.HasECH,
+		" mtproto=", result.IsMTProto, " loopback=", useLoopback)
+
+	handler, err := s.inboundManager.GetHandler(ctx, rule.handlerTag)
 	if err != nil {
-		return errors.New("selector: handler not found: ", handlerTag).Base(err)
+		return errors.New("handler not found: ", rule.handlerTag).Base(err)
 	}
 
-	// 5. Delegate to the target handler's full pipeline:
-	// transport (TLS/Reality) → proper context → proxy.Process.
-	// The handler builds its own context (tag, sniffing, session) —
-	// we do NOT pass the selector's context.
-	type connectionHandler interface {
-		HandleConnection(net.Conn) error
-	}
-	rawConn := unwrapRawConn(conn)
-	if ch, ok := handler.(connectionHandler); ok {
-		return ch.HandleConnection(rawConn)
+	if useLoopback {
+		return loopbackRelay(ctx, conn, rule.loopbackAddr, rule.proxyProtocol)
 	}
 
-	// Fallback for handlers that don't implement HandleConnection
+	// Direct call for handlers without transport security.
+	// Rewrite inbound tag so downstream routing sees the target handler.
+	if ib := session.InboundFromContext(ctx); ib != nil {
+		ib.Tag = rule.handlerTag
+	}
+
 	gi, ok := handler.(proxy.GetInbound)
 	if !ok {
-		return errors.New("selector: handler [", handlerTag, "] cannot handle connections")
+		return errors.New("handler [", rule.handlerTag, "] does not implement GetInbound")
 	}
-	return gi.GetInbound().Process(ctx, network, stat.Connection(rawConn), dispatcher)
+	return gi.GetInbound().Process(ctx, network, conn, dispatcher)
 }
 
-// unwrapRawConn peels off stat.CounterConnection wrappers to get the raw
-// net.Conn (typically *net.TCPConn) with native interface support.
-func unwrapRawConn(conn stat.Connection) net.Conn {
-	return stat.TryUnwrapStatsConn(conn)
-}
-
-// matchRules finds the first matching rule for the detection result.
-func (s *Selector) matchRules(result DetectionResult) string {
-	for _, r := range s.rules {
+func (s *Selector) matchRules(result DetectionResult) *compiledRule {
+	for i := range s.rules {
+		r := &s.rules[i]
 		switch r.match {
 		case "notls":
 			if !result.IsTLS {
-				return r.handlerTag
+				return r
 			}
 		case "tls":
 			if result.IsTLS && !result.HasECH {
 				if r.pattern == nil || r.pattern.MatchString(result.SNI) {
-					return r.handlerTag
+					return r
 				}
 			}
 		case "ech":
 			if result.IsTLS && result.HasECH {
 				if r.pattern == nil || r.pattern.MatchString(result.SNI) {
-					return r.handlerTag
+					return r
 				}
 			}
 		case "tls_default":
 			if result.IsTLS {
-				return r.handlerTag
+				return r
 			}
 		case "mtproto":
 			if result.IsMTProto {
-				return r.handlerTag
+				return r
 			}
 		case "unknown":
 			if !result.IsTLS && !result.IsMTProto {
-				return r.handlerTag
+				return r
 			}
 		}
 	}
-	return ""
+	return nil
 }
 
-func init() {
-	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
-		s := new(Selector)
-		err := core.RequireFeatures(ctx, func(im inbound.Manager) error {
-			return s.init(config.(*Config), im)
-		})
-		return s, err
-	}))
+// resolveLoopbackAddr checks whether the handler has transport security and a
+// listening port. Returns the listen address and true if loopback relay is
+// required, or empty string and false if the handler can be called directly.
+func resolveLoopbackAddr(im inbound.Manager, tag string) (string, bool) {
+	handler, err := im.GetHandler(context.Background(), tag)
+	if err != nil {
+		return "", false
+	}
+
+	receiverMsg := handler.ReceiverSettings()
+	if receiverMsg == nil {
+		return "", false
+	}
+
+	instance, err := receiverMsg.GetInstance()
+	if err != nil {
+		return "", false
+	}
+	rc, ok := instance.(*proxyman.ReceiverConfig)
+	if !ok {
+		return "", false
+	}
+
+	// No transport security → direct call is fine
+	ss := rc.GetStreamSettings()
+	if ss == nil || ss.GetSecurityType() == "" {
+		return "", false
+	}
+
+	// Has security but no port → cannot loopback, fallback to direct
+	pl := rc.GetPortList()
+	if pl == nil || len(pl.GetRange()) == 0 {
+		return "", false
+	}
+
+	addr := rc.Listen.AsAddress()
+	if addr == nil {
+		addr = xnet.LocalHostIP
+	}
+
+	return net.JoinHostPort(addr.String(), fmt.Sprintf("%d", pl.GetRange()[0].From)), true
 }
