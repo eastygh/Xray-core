@@ -3,6 +3,7 @@ package selector
 import (
 	"context"
 	"net"
+	"time"
 
 	proxyproto "github.com/pires/go-proxyproto"
 	"github.com/xtls/xray-core/common/buf"
@@ -12,7 +13,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
-const relayIdleTimeout = 5 * 60 // seconds
+const relayIdleTimeout = 5 * time.Minute
 
 func loopbackRelay(ctx context.Context, clientConn stat.Connection, targetAddr string, ppVersion uint32) error {
 	var d net.Dialer

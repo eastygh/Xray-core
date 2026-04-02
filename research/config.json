@@ -13,7 +13,8 @@
           {
             "match": "tls",
             "pattern": "^ya\\.ru$",
-            "handlerTag": "vless1"
+            "handlerTag": "vless1",
+            "proxyProtocol": 1
           },
           {
             "match": "mtproto",
@@ -49,6 +50,9 @@
               "keyFile": "/etc/ssl/ya.ru.key"
             }
           ]
+        },
+        "sockopt": {
+          "acceptProxyProtocol": true
         }
       }
     },

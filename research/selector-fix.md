@@ -1,120 +1,84 @@
-# Selector -> inbound routing fix
+# Selector: архитектура маршрутизации
 
-## Симптом
+## Два режима передачи соединений
 
-При маршрутизации TLS-соединения через selector на inbound VLESS с TLS/Reality:
+Selector определяет протокол по первым байтам (MSG_PEEK) и маршрутизирует к целевому handler'у одним из двух способов:
 
-```
-proxy/selector: selector: routing to handler [inbound-444] tls=true sni= ech=false mtproto=false
-proxy/vless/inbound: firstLen = 24
-connection ends > proxy/vless/inbound: invalid request from ... > proxy/vless/encoding: invalid request version
-```
+### 1. Loopback relay (handler с TLS/Reality)
 
-## Корневая причина
-
-Selector вызывал `proxy.Process()` напрямую, **обходя транспортный уровень** (TLS/Reality), который в нормальном потоке выполняется в `keepAccepting()` TCP listener'а (`transport/internet/tcp/hub.go:116-128`).
-
-VLESS получал сырые TLS-данные (байт `0x16`) вместо расшифрованного VLESS-протокола (байт `0x00`).
-
-MTProto работал потому что у него нет TLS на транспорте — прямой `proxy.Process()` корректен.
-
-## Неудачные подходы
-
-**1. bufferedConn + tls.Server/reality.Server** — оборачивали прочитанные байты в `bufferedConn` (`io.MultiReader`), применяли TLS/Reality к обёртке. `bufferedConn` не реализует нативные интерфейсы Reality (`CloseWriteConn`, `SyscallConn`, splice), даже после добавления `CloseWrite()` — panic или невалидные данные.
-
-**2. Pipe к listener'у (loopback)** — `net.Dial("tcp", "127.0.0.1:port")` + двунаправленное копирование. Overhead, потеря client IP, требует listener на порту.
-
-## Решение: MSG_PEEK + нативное соединение
-
-### Идея
-
-`syscall.Recvfrom(fd, buf, MSG_PEEK)` подсматривает данные в socket buffer **без потребления**. Оригинальный `*net.TCPConn` передаётся в TLS/Reality transport нетронутым — все нативные интерфейсы работают.
+Если целевой handler имеет transport security (`StreamSettings.SecurityType != ""`), selector устанавливает TCP-соединение к локальному порту handler'а и релеит данные. Handler получает соединение через свой штатный TCP listener → TLS handshake → proxy.Process.
 
 ```
-клиент → selector → peekBytes(MSG_PEEK) → детекция протокола
-                     [данные ОСТАЮТСЯ в socket buffer]
-                                ↓
-         ┌──────────────────────┴──────────────────────┐
-         │ handler с TLS/Reality                       │ handler без transport security
-         │                                             │
-         │ unwrap CounterConnection → *net.TCPConn     │ unwrap → *net.TCPConn
-         │ tls.Server() / reality.Server()             │ proxy.Process() напрямую
-         │ transport читает байты из socket buffer      │ proxy читает из socket buffer
-         │ → TLS handshake → расшифрованные данные     │
-         │ → proxy.Process()                           │
-         └─────────────────────────────────────────────┘
+клиент → selector:443 → net.Dial("127.0.0.1:10001") → handler listener
+                         ↕ buf.Copy (bidirectional)      ↓
+                         ← ← ← ← ← ← ← ← ← ← ←    TLS → proxy.Process
 ```
 
-### Параметры peek
+Опционально перед relay отправляется PROXY protocol v1/v2 header для передачи реального client IP.
 
-| Параметр | Дефолт | Описание |
-|---|---|---|
-| `readSize` | 2048 | Макс размер peek буфера |
-| `minPeekSize` | 16 | Мин байт перед детекцией |
-| `peekTimeoutMs` | 5000 | Таймаут (мс) от зависших соединений |
+### 2. Direct call (handler без transport security)
 
-```json
-{
-  "protocol": "selector",
-  "settings": {
-    "readSize": 2048,
-    "minPeekSize": 16,
-    "peekTimeoutMs": 5000,
-    "rules": [...],
-    "defaultHandlerTag": "..."
-  }
-}
+Если handler не имеет transport security (plain TCP, mtproto), selector вызывает `handler.GetInbound().Process()` напрямую, подменяя `inbound.Tag` на тег целевого handler'а.
+
+```
+клиент → selector:443 → handler.Process(ctx, network, conn, dispatcher)
+                         [inbound.Tag = "mtproto-in"]
 ```
 
-### Механика peek
+### Как определяется режим
 
-1. `SetReadDeadline(now + timeout)` — ограничиваем ожидание
-2. Цикл `MSG_PEEK` — повторяем пока не наберётся `minPeekSize` байт
-3. Между попытками `5ms` пауза для прибытия данных в socket buffer
-4. Если таймаут но есть байты → partial detection (TLS type без SNI)
-5. `SetReadDeadline(zero)` — сбрасываем deadline после peek
+Решение loopback/direct принимается по конфигурации **целевого handler'а**, не по типу match:
+
+```
+resolveLoopbackAddr(handler):
+  SecurityType != ""  → loopback (нужен TLS handshake через listener)
+  SecurityType == ""  → direct (transport security отсутствует)
+  Нет порта           → direct (некуда подключаться)
+```
+
+Это означает что любая комбинация match type + handler type корректна.
+
+## MSG_PEEK
+
+Чтение первых байт через `recvfrom(fd, buf, MSG_PEEK)` — данные остаются в socket buffer. При loopback relay `buf.Copy` передаёт эти же байты серверу. При direct call handler читает их при первом `Read()`.
 
 ### Платформы
 
-Общая логика в `peek.go`, platform-specific только `recvfromPeek()` + `isRetryable()`:
+| Файл | Платформа |
+|---|---|
+| `peek_unix.go` | Linux, macOS, BSD |
+| `peek_windows.go` | Windows |
 
-| Файл | Платформа | Отличие |
-|---|---|---|
-| `peek.go` | Все | Общая логика: deadline, retry loop, ошибки |
-| `peek_unix.go` | Linux, macOS, BSD | `Recvfrom(int(fd), MSG_PEEK)`, `EAGAIN`/`EWOULDBLOCK` |
-| `peek_windows.go` | Windows | `Recvfrom(Handle(fd), 0x2)`, `WSAEWOULDBLOCK` (10035) |
+## Idle timeout и half-close
 
-### Применение transport security
+Relay использует `signal.CancelAfterInactivity` (5 мин) с `buf.UpdateActivity(timer)` на обоих направлениях. После завершения client → server вызывается `CloseWrite()` на server conn для корректного TCP half-close.
 
-```go
-processConn := unwrapRawConn(conn)                          // CounterConnection → *net.TCPConn
-processConn, err = applyTransportSecurity(processConn, handler) // TLS/Reality если есть
-inboundProxy.Process(ctx, network, processConn, dispatcher)
+## Конфигурация правил
+
+```json
+{
+  "match": "tls",
+  "pattern": "^ya\\.ru$",
+  "handlerTag": "vless-in",
+  "loopbackAddr": "127.0.0.1:10001",
+  "proxyProtocol": 1
+}
 ```
 
-`applyTransportSecurity()` проверяет `ReceiverSettings()` handler'а:
-- Есть TLS → `tls.Server(conn, config.GetTLSConfig())`
-- Есть Reality → `reality.Server(conn, config.GetREALITYConfig())`
-- Нет security → conn без изменений
-
-### Почему это работает
-
-1. **MSG_PEEK** не потребляет данные — `Read()` вернёт те же байты
-2. **Оригинальный `*net.TCPConn`** — `CloseWrite`, `SyscallConn`, splice, sendfile
-3. **Reality** получает настоящий TCP-сокет → `MirrorConn`, type assertions, `io.Copy` работают
-4. **Универсально** — любой транспорт (TLS, Reality, plain TCP) без спецобработки
-5. **Zero-copy detection** — данные остаются в kernel buffer
+| Поле | Описание |
+|---|---|
+| `loopbackAddr` | Явный адрес для relay. Если пустой — автоматически из ReceiverConfig handler'а |
+| `proxyProtocol` | 0 = off, 1 = PROXY v1 (текст), 2 = PROXY v2 (бинарный) |
 
 ## Изменённые файлы
 
-| Файл | Что изменено |
+| Файл | Назначение |
 |---|---|
-| `proxy/selector/selector.go` | Peek + apply transport + конфиг параметры |
-| `proxy/selector/peek.go` | **Новый.** Общая логика peek с retry и timeout |
-| `proxy/selector/peek_unix.go` | **Новый.** `recvfromPeek()` для Unix |
-| `proxy/selector/peek_windows.go` | **Новый.** `recvfromPeek()` для Windows |
-| `proxy/selector/config.proto` | Поля `peek_timeout_ms`, `min_peek_size` |
-| `proxy/selector/config.pb.go` | Соответствующие поля + getter'ы |
-| `infra/conf/selector.go` | JSON-поля `peekTimeoutMs`, `minPeekSize` |
-
-Основной код (handler'ы, worker'ы, transport layer) **не затронут**.
+| `proxy/selector/selector.go` | Routing logic, resolveLoopbackAddr |
+| `proxy/selector/relay.go` | Loopback relay + PROXY protocol (через go-proxyproto) |
+| `proxy/selector/peek.go` | MSG_PEEK с retry и timeout |
+| `proxy/selector/peek_unix.go` | recvfromPeek для Unix |
+| `proxy/selector/peek_windows.go` | recvfromPeek для Windows |
+| `proxy/selector/detect.go` | Детекция TLS/ECH/MTProto |
+| `proxy/selector/config.proto` | Protobuf-определение Config и Rule |
+| `infra/conf/selector.go` | JSON-конфиг → protobuf |

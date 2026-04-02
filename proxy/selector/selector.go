@@ -92,8 +92,15 @@ func (s *Selector) init(config *Config, im inbound.Manager) error {
 		// listener so TLS handshake happens normally.
 		if r.LoopbackAddr != "" {
 			cr.loopbackAddr = r.LoopbackAddr
-		} else if addr, hasSecurity := resolveLoopbackAddr(im, cr.handlerTag); hasSecurity {
-			cr.loopbackAddr = addr
+		} else {
+			info := resolveHandlerInfo(im, cr.handlerTag)
+			if info.hasSecurity {
+				cr.loopbackAddr = info.addr
+			}
+			// Suppress PROXY protocol if handler doesn't accept it
+			if cr.proxyProtocol > 0 && !info.acceptPP {
+				cr.proxyProtocol = 0
+			}
 		}
 		s.rules = append(s.rules, cr)
 	}
@@ -120,12 +127,13 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 			return errors.New("no matching rule and no default handler")
 		}
 		// Build a default rule on demand. Resolve loopback only if needed.
+		info := resolveHandlerInfo(s.inboundManager, s.config.DefaultHandlerTag)
 		rule = &compiledRule{
 			match:      "default",
 			handlerTag: s.config.DefaultHandlerTag,
 		}
-		if addr, hasSecurity := resolveLoopbackAddr(s.inboundManager, rule.handlerTag); hasSecurity {
-			rule.loopbackAddr = addr
+		if info.hasSecurity {
+			rule.loopbackAddr = info.addr
 		}
 	}
 
@@ -194,39 +202,39 @@ func (s *Selector) matchRules(result DetectionResult) *compiledRule {
 	return nil
 }
 
-// resolveLoopbackAddr checks whether the handler has transport security and a
-// listening port. Returns the listen address and true if loopback relay is
-// required, or empty string and false if the handler can be called directly.
-func resolveLoopbackAddr(im inbound.Manager, tag string) (string, bool) {
+type handlerInfo struct {
+	addr        string
+	hasSecurity bool
+	acceptPP    bool
+}
+
+func resolveHandlerInfo(im inbound.Manager, tag string) handlerInfo {
 	handler, err := im.GetHandler(context.Background(), tag)
 	if err != nil {
-		return "", false
+		return handlerInfo{}
 	}
 
 	receiverMsg := handler.ReceiverSettings()
 	if receiverMsg == nil {
-		return "", false
+		return handlerInfo{}
 	}
 
 	instance, err := receiverMsg.GetInstance()
 	if err != nil {
-		return "", false
+		return handlerInfo{}
 	}
 	rc, ok := instance.(*proxyman.ReceiverConfig)
 	if !ok {
-		return "", false
+		return handlerInfo{}
 	}
 
-	// No transport security → direct call is fine
 	ss := rc.GetStreamSettings()
-	if ss == nil || ss.GetSecurityType() == "" {
-		return "", false
-	}
+	hasSecurity := ss != nil && ss.GetSecurityType() != ""
+	acceptPP := ss != nil && ss.GetSocketSettings().GetAcceptProxyProtocol()
 
-	// Has security but no port → cannot loopback, fallback to direct
 	pl := rc.GetPortList()
 	if pl == nil || len(pl.GetRange()) == 0 {
-		return "", false
+		return handlerInfo{acceptPP: acceptPP}
 	}
 
 	addr := rc.Listen.AsAddress()
@@ -234,5 +242,9 @@ func resolveLoopbackAddr(im inbound.Manager, tag string) (string, bool) {
 		addr = xnet.LocalHostIP
 	}
 
-	return net.JoinHostPort(addr.String(), fmt.Sprintf("%d", pl.GetRange()[0].From)), true
+	return handlerInfo{
+		addr:        net.JoinHostPort(addr.String(), fmt.Sprintf("%d", pl.GetRange()[0].From)),
+		hasSecurity: hasSecurity,
+		acceptPP:    acceptPP,
+	}
 }
