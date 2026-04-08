@@ -32,7 +32,7 @@ func init() {
 const (
 	defaultReadSize    = 2048
 	defaultPeekTimeout = 5 * time.Second
-	defaultMinPeekSize = 16
+	defaultMinPeekSize = 254
 )
 
 type compiledRule struct {
@@ -174,13 +174,13 @@ func (s *Selector) matchRules(result DetectionResult) *compiledRule {
 				return r
 			}
 		case "tls":
-			if result.IsTLS && !result.HasECH {
+			if result.IsTLS {
 				if r.pattern == nil || r.pattern.MatchString(result.SNI) {
 					return r
 				}
 			}
 		case "ech":
-			if result.IsTLS && result.HasECH {
+			if result.IsTLS && result.HasECH && result.SNI == "" {
 				if r.pattern == nil || r.pattern.MatchString(result.SNI) {
 					return r
 				}
