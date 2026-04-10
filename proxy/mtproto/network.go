@@ -14,7 +14,7 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 )
 
-// xrayNetwork implements mtglib.Network using xray's dispatcher for outbound connections.
+// xrayNetwork implements mtglib.Network using xray's dispatcher.
 type xrayNetwork struct {
 	dispatcher routing.Dispatcher
 	mu         sync.Mutex

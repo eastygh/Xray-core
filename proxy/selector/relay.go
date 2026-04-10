@@ -21,7 +21,7 @@ func loopbackRelay(ctx context.Context, clientConn stat.Connection, targetAddr s
 	if err != nil {
 		return errors.New("failed to dial loopback ", targetAddr).Base(err)
 	}
-	defer serverConn.Close()
+	defer func() { _ = serverConn.Close() }()
 
 	if ppVersion > 0 && ppVersion <= 2 {
 		header := proxyproto.HeaderProxyFromAddrs(byte(ppVersion), clientConn.RemoteAddr(), clientConn.LocalAddr())
@@ -31,6 +31,7 @@ func loopbackRelay(ctx context.Context, clientConn stat.Connection, targetAddr s
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	timer := signal.CancelAfterInactivity(ctx, cancel, relayIdleTimeout)
 
 	requestDone := func() error {
@@ -38,7 +39,6 @@ func loopbackRelay(ctx context.Context, clientConn stat.Connection, targetAddr s
 		if err := buf.Copy(buf.NewReader(clientConn), buf.NewWriter(serverConn), buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to relay request").Base(err)
 		}
-		// Half-close: signal EOF to the target handler so it can finish its response
 		if tc, ok := serverConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
