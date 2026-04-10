@@ -117,7 +117,7 @@ func (s *Selector) Network() []xnet.Network {
 
 // Process implements proxy.Inbound.
 func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
-	firstBytes, err := peekBytes(conn, s.readSize, s.minPeekSize, s.peekTimeout)
+	firstBytes, err := peekSNI(conn, s.readSize, s.minPeekSize, s.peekTimeout)
 	if err != nil {
 		return errors.New("failed to peek first bytes").Base(err)
 	}
@@ -125,6 +125,10 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 	var sni string
 	if h, err := tls.SniffTLS(firstBytes); err == nil {
 		sni = h.Domain()
+	}
+
+	if sni == "" {
+		errors.LogWarning(ctx, "No sni found in first bytes, route to default handler")
 	}
 
 	var rule *compiledRule
