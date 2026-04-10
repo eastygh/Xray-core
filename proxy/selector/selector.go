@@ -152,7 +152,7 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 	}
 
 	if rule.loopbackAddr != "" {
-		return loopbackRelay(ctx, conn, rule.loopbackAddr, rule.proxyProtocol)
+		return loopbackRelayV2(ctx, conn, rule.loopbackAddr, rule.proxyProtocol)
 	}
 
 	if ib := session.InboundFromContext(ctx); ib != nil {
