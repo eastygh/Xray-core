@@ -36,6 +36,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/finalmask/xicmp"
 	"github.com/xtls/xray-core/transport/internet/httpupgrade"
 	"github.com/xtls/xray-core/transport/internet/hysteria"
+	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/kcp"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
@@ -630,6 +631,7 @@ func (c *TLSCertConfig) Build() (*tls.Certificate, error) {
 type QuicParamsConfig struct {
 	Congestion                  string    `json:"congestion"`
 	Debug                       bool      `json:"debug"`
+	BbrProfile                  string    `json:"bbrProfile"`
 	BrutalUp                    Bandwidth `json:"brutalUp"`
 	BrutalDown                  Bandwidth `json:"brutalDown"`
 	UdpHop                      UdpHop    `json:"udpHop"`
@@ -1425,10 +1427,11 @@ func (c *FragmentMask) Build() (proto.Message, error) {
 }
 
 type NoiseItem struct {
-	Rand   Int32Range      `json:"rand"`
-	Type   string          `json:"type"`
-	Packet json.RawMessage `json:"packet"`
-	Delay  Int32Range      `json:"delay"`
+	Rand      Int32Range      `json:"rand"`
+	RandRange *Int32Range     `json:"randRange"`
+	Type      string          `json:"type"`
+	Packet    json.RawMessage `json:"packet"`
+	Delay     Int32Range      `json:"delay"`
 }
 
 type NoiseMask struct {
@@ -1445,16 +1448,24 @@ func (c *NoiseMask) Build() (proto.Message, error) {
 
 	noiseSlice := make([]*noise.Item, 0, len(c.Noise))
 	for _, item := range c.Noise {
+		if item.RandRange == nil {
+			item.RandRange = &Int32Range{From: 0, To: 255}
+		}
+		if item.RandRange.From < 0 || item.RandRange.To > 255 {
+			return nil, errors.New("invalid randRange")
+		}
 		var err error
 		if item.Packet, err = PraseByteSlice(item.Packet, item.Type); err != nil {
 			return nil, err
 		}
 		noiseSlice = append(noiseSlice, &noise.Item{
-			RandMin:  int64(item.Rand.From),
-			RandMax:  int64(item.Rand.To),
-			Packet:   item.Packet,
-			DelayMin: int64(item.Delay.From),
-			DelayMax: int64(item.Delay.To),
+			RandMin:      int64(item.Rand.From),
+			RandMax:      int64(item.Rand.To),
+			RandRangeMin: item.RandRange.From,
+			RandRangeMax: item.RandRange.To,
+			Packet:       item.Packet,
+			DelayMin:     int64(item.Delay.From),
+			DelayMax:     int64(item.Delay.To),
 		})
 	}
 
@@ -1885,6 +1896,16 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 			config.Udpmasks = append(config.Udpmasks, serial.ToTypedMessage(u))
 		}
 		if c.FinalMask.QuicParams != nil {
+			profile := strings.ToLower(c.FinalMask.QuicParams.BbrProfile)
+			switch profile {
+			case "", string(bbr.ProfileConservative), string(bbr.ProfileStandard), string(bbr.ProfileAggressive):
+				if profile == "" {
+					profile = string(bbr.ProfileStandard)
+				}
+			default:
+				return nil, errors.New("unknown bbr profile")
+			}
+
 			up, err := c.FinalMask.QuicParams.BrutalUp.Bps()
 			if err != nil {
 				return nil, err
@@ -1956,6 +1977,7 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 
 			config.QuicParams = &internet.QuicParams{
 				Congestion: c.FinalMask.QuicParams.Congestion,
+				BbrProfile: profile,
 				BrutalUp:   up,
 				BrutalDown: down,
 				UdpHop: &internet.UdpHop{
