@@ -7,8 +7,8 @@ import (
 )
 
 type SelectorRule struct {
-	Match         string `json:"match"`
-	Pattern       string `json:"pattern"`
+	Match         string `json:"match"`   // exact SNI or empty for catch-all
+	Pattern       string `json:"pattern"` // regex SNI (takes priority over match)
 	HandlerTag    string `json:"handlerTag"`
 	LoopbackAddr  string `json:"loopbackAddr"`
 	ProxyProtocol uint32 `json:"proxyProtocol"`
