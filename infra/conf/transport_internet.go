@@ -45,6 +45,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tcp"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"github.com/xtls/xray-core/transport/internet/websocket"
+	"github.com/xtls/xray-core/transport/internet/xoren"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -211,6 +212,63 @@ func (c *HttpUpgradeConfig) Build() (proto.Message, error) {
 		Ed:                  ed,
 	}
 	return config, nil
+}
+
+type XorenConfig struct {
+	Key                 []json.RawMessage `json:"key"`
+	AcceptProxyProtocol bool              `json:"acceptProxyProtocol"`
+}
+
+// Build implements Buildable.
+func (c *XorenConfig) Build() (proto.Message, error) {
+	if len(c.Key) == 0 {
+		return nil, errors.New(`xoren: "key" is required and must be a non-empty array`)
+	}
+
+	key := make([]byte, 0, len(c.Key))
+	for i, raw := range c.Key {
+		s := strings.TrimSpace(string(raw))
+		if s == "" {
+			return nil, errors.New("xoren: empty value in key[", i, "]")
+		}
+
+		// Try string form first ("0x01", "01", "0xff", etc.).
+		if s[0] == '"' {
+			var str string
+			if err := json.Unmarshal(raw, &str); err != nil {
+				return nil, errors.New("xoren: invalid key[", i, "]: ").Base(err)
+			}
+			str = strings.TrimSpace(str)
+			str = strings.TrimPrefix(str, "0x")
+			str = strings.TrimPrefix(str, "0X")
+			if len(str) == 0 || len(str)%2 != 0 {
+				return nil, errors.New("xoren: key[", i, "] must encode whole bytes: ", string(raw))
+			}
+			b, err := hex.DecodeString(str)
+			if err != nil {
+				return nil, errors.New("xoren: invalid hex in key[", i, "]: ", string(raw)).Base(err)
+			}
+			key = append(key, b...)
+			continue
+		}
+
+		// Numeric form (0-255). JSON does not allow 0xNN literals, so the upstream
+		// JSON reader is responsible for stripping comments only; numbers must be
+		// plain decimal in the input. Users who want hex syntax should quote it.
+		var n int
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return nil, errors.New("xoren: invalid key[", i, "]: ", string(raw)).Base(err)
+		}
+		if n < 0 || n > 255 {
+			return nil, errors.New("xoren: key[", i, "] out of byte range: ", n)
+		}
+		key = append(key, byte(n))
+	}
+
+	return &xoren.Config{
+		Key:                 key,
+		AcceptProxyProtocol: c.AcceptProxyProtocol,
+	}, nil
 }
 
 type SplitHTTPConfig struct {
@@ -1015,6 +1073,8 @@ func (p TransportProtocol) Build() (string, error) {
 		return "", errors.PrintRemovedFeatureError("QUIC transport (without web service, etc.)", "XHTTP stream-one H3")
 	case "hysteria":
 		return "hysteria", nil
+	case "xoren":
+		return "xoren", nil
 	default:
 		return "", errors.New("Config: unknown transport protocol: ", p)
 	}
@@ -1951,6 +2011,7 @@ type StreamConfig struct {
 	WSSettings          *WebSocketConfig   `json:"wsSettings"`
 	HTTPUPGRADESettings *HttpUpgradeConfig `json:"httpupgradeSettings"`
 	HysteriaSettings    *HysteriaConfig    `json:"hysteriaSettings"`
+	XorenSettings       *XorenConfig       `json:"xorenSettings"`
 	SocketSettings      *SocketConfig      `json:"sockopt"`
 }
 
@@ -2079,6 +2140,16 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 		config.TransportSettings = append(config.TransportSettings, &internet.TransportConfig{
 			ProtocolName: "hysteria",
 			Settings:     serial.ToTypedMessage(hs),
+		})
+	}
+	if c.XorenSettings != nil {
+		xs, err := c.XorenSettings.Build()
+		if err != nil {
+			return nil, errors.New("Failed to build XOREN config.").Base(err)
+		}
+		config.TransportSettings = append(config.TransportSettings, &internet.TransportConfig{
+			ProtocolName: "xoren",
+			Settings:     serial.ToTypedMessage(xs),
 		})
 	}
 	if c.SocketSettings != nil {

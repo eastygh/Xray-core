@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package xray.transport.internet.xoren;
+option csharp_namespace = "Xray.Transport.Internet.Xoren";
+option go_package = "github.com/xtls/xray-core/transport/internet/xoren";
+option java_package = "com.xray.transport.internet.xoren";
+option java_multiple_files = true;
+
+message Config {
+  bytes key = 1;
+  bool accept_proxy_protocol = 2;
+}
