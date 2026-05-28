@@ -45,6 +45,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tcp"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"github.com/xtls/xray-core/transport/internet/websocket"
+	"github.com/xtls/xray-core/transport/internet/xorex"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -561,6 +562,27 @@ func (c *HysteriaConfig) Build() (proto.Message, error) {
 	return config, nil
 }
 
+type XorexConfig struct {
+	Key string `json:"key"`
+}
+
+// Build implements Buildable.
+func (c *XorexConfig) Build() (proto.Message, error) {
+	if c.Key == "" {
+		return nil, errors.New("xorex key must not be empty")
+	}
+	key, err := hex.DecodeString(c.Key)
+	if err != nil {
+		return nil, errors.New("invalid xorex key: ", c.Key).Base(err)
+	}
+	if len(key) == 0 {
+		return nil, errors.New("xorex key must not be empty")
+	}
+	return &xorex.Config{
+		Key: key,
+	}, nil
+}
+
 func readFileOrString(f string, s []string) ([]byte, error) {
 	if len(f) > 0 {
 		return filesystem.ReadCert(f)
@@ -1015,6 +1037,8 @@ func (p TransportProtocol) Build() (string, error) {
 		return "", errors.PrintRemovedFeatureError("QUIC transport (without web service, etc.)", "XHTTP stream-one H3")
 	case "hysteria":
 		return "hysteria", nil
+	case "xorex":
+		return "xorex", nil
 	default:
 		return "", errors.New("Config: unknown transport protocol: ", p)
 	}
@@ -1951,6 +1975,7 @@ type StreamConfig struct {
 	WSSettings          *WebSocketConfig   `json:"wsSettings"`
 	HTTPUPGRADESettings *HttpUpgradeConfig `json:"httpupgradeSettings"`
 	HysteriaSettings    *HysteriaConfig    `json:"hysteriaSettings"`
+	XorexSettings       *XorexConfig       `json:"xorexSettings"`
 	SocketSettings      *SocketConfig      `json:"sockopt"`
 }
 
@@ -2079,6 +2104,16 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 		config.TransportSettings = append(config.TransportSettings, &internet.TransportConfig{
 			ProtocolName: "hysteria",
 			Settings:     serial.ToTypedMessage(hs),
+		})
+	}
+	if c.XorexSettings != nil {
+		xs, err := c.XorexSettings.Build()
+		if err != nil {
+			return nil, errors.New("Failed to build Xorex config.").Base(err)
+		}
+		config.TransportSettings = append(config.TransportSettings, &internet.TransportConfig{
+			ProtocolName: "xorex",
+			Settings:     serial.ToTypedMessage(xs),
 		})
 	}
 	if c.SocketSettings != nil {
