@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package xray.proxy.whatsapp;
+option go_package = "github.com/xtls/xray-core/proxy/whatsapp";
+
+// Target identifies which WhatsApp upstream a connection should be sent to.
+enum Target {
+  TARGET_UNSPECIFIED = 0;
+  TARGET_CHAT = 1;
+  TARGET_MEDIA = 2;
+}
+
+message Config {
+  // Upstream for chat (XMPP/Noise) traffic. Default: chatd.whatsapp.net.
+  string chat_host = 1;
+  uint32 chat_port = 2;
+
+  // Upstream for media traffic. Default: media.fmnl3-1.fna.whatsapp.net (a
+  // representative cdn host; usually overridden via routing rules or DNS).
+  string media_host = 3;
+  uint32 media_port = 4;
+
+  // Ports that should be routed to the chat upstream by default.
+  repeated uint32 chat_ports = 5;
+
+  // Ports that should be routed to the media upstream by default.
+  repeated uint32 media_ports = 6;
+
+  // If true, on connections to a chat_port that looks like TLS (443/8443/...),
+  // peek the ClientHello and route by SNI: any *.cdn.whatsapp.net SNI goes to
+  // media, everything else to chat.
+  bool sniff_sni = 7;
+
+  // Fallback target when neither port nor SNI matches. Default: TARGET_CHAT.
+  Target default_target = 8;
+}

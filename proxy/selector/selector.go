@@ -11,6 +11,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/peek"
 	"github.com/xtls/xray-core/common/protocol/tls"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
@@ -117,7 +118,7 @@ func (s *Selector) Network() []xnet.Network {
 
 // Process implements proxy.Inbound.
 func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
-	firstBytes, err := peekSNI(conn, s.readSize, s.minPeekSize, s.peekTimeout)
+	firstBytes, err := peek.SNI(conn, s.readSize, s.minPeekSize, s.peekTimeout)
 	if err != nil {
 		return errors.New("failed to peek first bytes").Base(err)
 	}

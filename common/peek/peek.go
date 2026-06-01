@@ -1,8 +1,11 @@
-package selector
+// Package peek reads bytes from a TCP socket without consuming them, so the
+// caller can inspect early protocol data (e.g. TLS ClientHello) and still hand
+// the connection downstream unchanged. Uses MSG_PEEK on Unix and the Winsock
+// equivalent on Windows.
+package peek
 
 import (
 	"encoding/binary"
-	"net"
 	"syscall"
 	"time"
 
@@ -10,10 +13,10 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
-// peekBytes reads up to maxSize bytes from the socket buffer using MSG_PEEK
-// without consuming them. Retries until at least minSize bytes arrive or
-// timeout expires.
-func peekBytes(conn stat.Connection, maxSize int, minSize int, timeout time.Duration) ([]byte, error) {
+// Bytes peeks up to maxSize bytes from conn's receive buffer, retrying until
+// at least minSize bytes are available or timeout expires. Bytes are NOT
+// consumed — a subsequent Read on conn will see them again.
+func Bytes(conn stat.Connection, maxSize int, minSize int, timeout time.Duration) ([]byte, error) {
 	raw := stat.TryUnwrapStatsConn(conn)
 
 	sc, ok := raw.(syscall.Conn)
@@ -25,8 +28,8 @@ func peekBytes(conn stat.Connection, maxSize int, minSize int, timeout time.Dura
 		return nil, err
 	}
 
-	raw.(net.Conn).SetReadDeadline(time.Now().Add(timeout))
-	defer raw.(net.Conn).SetReadDeadline(time.Time{})
+	raw.SetReadDeadline(time.Now().Add(timeout))
+	defer raw.SetReadDeadline(time.Time{})
 
 	buf := make([]byte, maxSize)
 	var total int
@@ -61,11 +64,10 @@ func peekBytes(conn stat.Connection, maxSize int, minSize int, timeout time.Dura
 	return buf[:total], nil
 }
 
-// peek bytes from TLS handshake while SNI is not available
-// peekBytes reads up to maxSize bytes from the socket buffer using MSG_PEEK
-// without consuming them. Retries until at least minSize bytes arrive or
-// timeout expires.
-func peekSNI(conn stat.Connection, maxSize int, minSize int, timeout time.Duration) ([]byte, error) {
+// SNI behaves like Bytes but, once a TLS record header has arrived, grows the
+// target read size to cover the full ClientHello record so the SNI extension
+// can be parsed without further reads.
+func SNI(conn stat.Connection, maxSize int, minSize int, timeout time.Duration) ([]byte, error) {
 	raw := stat.TryUnwrapStatsConn(conn)
 
 	sc, ok := raw.(syscall.Conn)
@@ -77,8 +79,8 @@ func peekSNI(conn stat.Connection, maxSize int, minSize int, timeout time.Durati
 		return nil, err
 	}
 
-	raw.(net.Conn).SetReadDeadline(time.Now().Add(timeout))
-	defer raw.(net.Conn).SetReadDeadline(time.Time{})
+	raw.SetReadDeadline(time.Now().Add(timeout))
+	defer raw.SetReadDeadline(time.Time{})
 
 	buf := make([]byte, maxSize)
 	var total int

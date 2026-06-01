@@ -33,6 +33,7 @@ var (
 		"tun":           func() interface{} { return new(TunConfig) },
 		"selector":      func() interface{} { return new(SelectorConfig) },
 		"mtproto":       func() interface{} { return new(MTProtoConfig) },
+		"whatsapp":      func() interface{} { return new(WhatsAppConfig) },
 	}, "protocol", "settings")
 
 	outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{

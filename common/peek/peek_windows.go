@@ -1,19 +1,21 @@
-//go:build !windows
+//go:build windows
 
-package selector
+package peek
 
-import (
-	"errors"
-	"syscall"
+import "syscall"
+
+const (
+	msgPeek        = 0x2   // Winsock MSG_PEEK
+	wsaeWouldBlock = 10035 // Winsock WSAEWOULDBLOCK
 )
 
 // recvfromPeek performs a non-consuming peek read from the socket fd.
 func recvfromPeek(fd uintptr, buf []byte) (int, error) {
-	n, _, err := syscall.Recvfrom(int(fd), buf, syscall.MSG_PEEK)
+	n, _, err := syscall.Recvfrom(syscall.Handle(fd), buf, msgPeek)
 	return n, err
 }
 
 // isRetryable returns true if the error indicates the socket has no data yet.
 func isRetryable(err error) bool {
-	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)
+	return err == syscall.Errno(wsaeWouldBlock)
 }
