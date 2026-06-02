@@ -20,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/transport/internet/xoren"
 )
 
 func init() {
@@ -44,6 +45,7 @@ type compiledRule struct {
 	handlerTag    string
 	loopbackAddr  string
 	proxyProtocol uint32
+	xorenKey      []byte // non-nil when the target inbound uses the xoren transport
 }
 
 func (r *compiledRule) matchSNI(sni string) bool {
@@ -95,11 +97,12 @@ func (s *Selector) init(config *Config, im inbound.Manager) error {
 			cr.pattern = re
 			cr.sni = "" // pattern takes priority
 		}
+		info := resolveHandlerInfo(im, cr.handlerTag)
+		cr.xorenKey = info.xorenKey
 		if r.LoopbackAddr != "" {
 			cr.loopbackAddr = r.LoopbackAddr
 		} else {
-			info := resolveHandlerInfo(im, cr.handlerTag)
-			if info.hasSecurity {
+			if info.hasSecurity || len(info.xorenKey) > 0 {
 				cr.loopbackAddr = info.addr
 			}
 			if cr.proxyProtocol > 0 && !info.acceptPP {
@@ -128,15 +131,31 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 		sni = h.Domain()
 	}
 
-	if sni == "" {
-		errors.LogWarning(ctx, "No sni found in first bytes, route to default handler")
-	}
-
+	// xoren carries no TLS/SNI — its first bytes are an authenticated, noise-like
+	// preamble. Detect it from the peeked bytes (key in hand) before falling back
+	// to SNI matching.
 	var rule *compiledRule
 	for i := range s.rules {
-		if s.rules[i].matchSNI(sni) {
+		if len(s.rules[i].xorenKey) > 0 && xoren.VerifyHandshake(firstBytes, s.rules[i].xorenKey) {
 			rule = &s.rules[i]
 			break
+		}
+	}
+
+	if rule == nil {
+		if sni == "" {
+			errors.LogWarning(ctx, "No sni found in first bytes, route to default handler")
+		}
+		for i := range s.rules {
+			// xoren rules are matched only by handshake above, never by SNI —
+			// otherwise an empty-match xoren rule would act as a catch-all.
+			if len(s.rules[i].xorenKey) > 0 {
+				continue
+			}
+			if s.rules[i].matchSNI(sni) {
+				rule = &s.rules[i]
+				break
+			}
 		}
 	}
 
@@ -160,6 +179,10 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 		ib.Tag = rule.handlerTag
 	}
 
+	// Pass the SNI we already peeked down to the inner inbound so it can avoid
+	// peeking the same connection again (e.g. whatsapp's chat/media decision).
+	ctx = session.ContextWithSniffedSNI(ctx, sni)
+
 	gi, ok := handler.(proxy.GetInbound)
 	if !ok {
 		return errors.New("handler [", rule.handlerTag, "] does not implement GetInbound")
@@ -171,6 +194,7 @@ type handlerInfo struct {
 	addr        string
 	hasSecurity bool
 	acceptPP    bool
+	xorenKey    []byte
 }
 
 func resolveHandlerInfo(im inbound.Manager, tag string) handlerInfo {
@@ -200,9 +224,16 @@ func resolveHandlerInfo(im inbound.Manager, tag string) handlerInfo {
 	hasSecurity := mss.SecurityType != ""
 	acceptPP := mss.SocketSettings.GetAcceptProxyProtocol()
 
+	var xorenKey []byte
+	if mss.ProtocolName == "xoren" {
+		if xc, ok := mss.ProtocolSettings.(*xoren.Config); ok {
+			xorenKey = xc.GetKey()
+		}
+	}
+
 	pl := rc.GetPortList()
 	if pl == nil || len(pl.GetRange()) == 0 {
-		return handlerInfo{hasSecurity: hasSecurity, acceptPP: acceptPP}
+		return handlerInfo{hasSecurity: hasSecurity, acceptPP: acceptPP, xorenKey: xorenKey}
 	}
 
 	addr := rc.Listen.AsAddress()
@@ -214,5 +245,6 @@ func resolveHandlerInfo(im inbound.Manager, tag string) handlerInfo {
 		addr:        net.JoinHostPort(addr.String(), fmt.Sprintf("%d", pl.GetRange()[0].From)),
 		hasSecurity: hasSecurity,
 		acceptPP:    acceptPP,
+		xorenKey:    xorenKey,
 	}
 }

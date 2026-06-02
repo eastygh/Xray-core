@@ -28,7 +28,13 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		return nil, errors.New("xoren: empty key")
 	}
 
-	return stat.Connection(newXorConn(conn, xorenSettings.Key)), nil
+	streamKey, err := clientHandshake(conn, xorenSettings.Key)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	return stat.Connection(newXorConn(conn, streamKey)), nil
 }
 
 func init() {

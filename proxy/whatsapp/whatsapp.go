@@ -121,6 +121,10 @@ func (h *Handler) Process(ctx context.Context, network xnet.Network, conn stat.C
 	})
 	errors.LogInfo(ctx, "whatsapp ", conn.RemoteAddr(), " -> ", dest, " (", targetName(target), ")")
 
+	if ib := session.InboundFromContext(ctx); ib != nil {
+		errors.LogInfo(ctx, "whatsapp debug: inbound.Tag=", ib.Tag, " inbound.Name=", ib.Name)
+	}
+
 	link := &transport.Link{
 		Reader: buf.NewReader(conn),
 		Writer: buf.NewWriter(conn),
@@ -139,7 +143,12 @@ func (h *Handler) pickTarget(ctx context.Context, conn stat.Connection, port uin
 	}
 	_, isChatPort := h.chatPorts[port]
 	if isChatPort && h.sniffSNI {
-		if sni := peekSNI(ctx, conn); sni != "" && isMediaSNI(sni) {
+		sni, ok := session.SniffedSNIFromContext(ctx)
+		if !ok {
+			// No upstream inbound peeked this connection — do it ourselves.
+			sni = peekSNI(ctx, conn)
+		}
+		if sni != "" && isMediaSNI(sni) {
 			return Target_TARGET_MEDIA
 		}
 		return Target_TARGET_CHAT

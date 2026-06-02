@@ -72,7 +72,13 @@ func (l *Listener) keepAccepting() {
 			continue
 		}
 		go func(c net.Conn) {
-			l.addConn(stat.Connection(newXorConn(c, l.config.Key)))
+			streamKey, err := serverHandshake(c, l.config.Key)
+			if err != nil {
+				errors.LogDebug(context.Background(), "xoren: dropping connection: ", err)
+				_ = c.Close()
+				return
+			}
+			l.addConn(stat.Connection(newXorConn(c, streamKey)))
 		}(conn)
 	}
 }
