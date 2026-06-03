@@ -2,6 +2,7 @@ package whatsapp
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -21,9 +22,13 @@ import (
 )
 
 const (
-	defaultChatHost  = "chatd.whatsapp.net"
+	// Backends mirror the official WhatsApp proxy (github.com/WhatsApp/proxy,
+	// proxy/src/proxy_config.cfg): chat/XMPP traffic goes to g.whatsapp.net:5222
+	// with a PROXY-protocol v1 header (HAProxy "send-proxy"); media traffic goes
+	// to whatsapp.net:443 with no header.
+	defaultChatHost  = "g.whatsapp.net"
 	defaultChatPort  = 5222
-	defaultMediaHost = "mmg.whatsapp.net"
+	defaultMediaHost = "whatsapp.net"
 	defaultMediaPort = 443
 
 	sniffReadSize    = 2048
@@ -125,14 +130,59 @@ func (h *Handler) Process(ctx context.Context, network xnet.Network, conn stat.C
 		errors.LogInfo(ctx, "whatsapp debug: inbound.Tag=", ib.Tag, " inbound.Name=", ib.Name)
 	}
 
+	var reader buf.Reader = buf.NewReader(conn)
+	// The chat/XMPP backend (g.whatsapp.net) is fronted by HAProxy "send-proxy":
+	// it expects a PROXY-protocol v1 line as the very first bytes, carrying the
+	// real client address. Without it the edge stalls parsing the Noise
+	// handshake as a malformed header and the client hangs in "Connecting...".
+	// Media (whatsapp.net:443) is a plain relay and must NOT receive a header.
+	if target == Target_TARGET_CHAT {
+		header := proxyProtocolHeaderV1(conn.RemoteAddr(), conn.LocalAddr())
+		if header != nil {
+			b := buf.New()
+			b.Write(header)
+			reader = &buf.BufferedReader{
+				Reader: reader,
+				Buffer: buf.MultiBuffer{b},
+			}
+		}
+	}
+
 	link := &transport.Link{
-		Reader: buf.NewReader(conn),
+		Reader: reader,
 		Writer: buf.NewWriter(conn),
 	}
 	if err := dispatcher.DispatchLink(ctx, dest, link); err != nil {
 		return errors.New("failed to dispatch whatsapp link").Base(err)
 	}
 	return nil
+}
+
+// proxyProtocolHeaderV1 builds a PROXY-protocol v1 header line
+// ("PROXY TCP4 <src_ip> <dst_ip> <src_port> <dst_port>\r\n") describing the
+// client->proxy connection, matching HAProxy's "send-proxy". src is the real
+// client (conn.RemoteAddr), dst is the local address the client connected to
+// (conn.LocalAddr). When the addresses can't be expressed in a v1 line it falls
+// back to the valid "PROXY UNKNOWN\r\n" line rather than nil: the edge still
+// needs *some* header first, it just won't learn the real client IP.
+func proxyProtocolHeaderV1(src, dst net.Addr) []byte {
+	srcTCP, ok1 := src.(*net.TCPAddr)
+	dstTCP, ok2 := dst.(*net.TCPAddr)
+	if !ok1 || !ok2 {
+		return []byte("PROXY UNKNOWN\r\n")
+	}
+	src4, dst4 := srcTCP.IP.To4(), dstTCP.IP.To4()
+	switch {
+	case src4 != nil && dst4 != nil:
+		return fmt.Appendf(nil, "PROXY TCP4 %s %s %d %d\r\n",
+			src4.String(), dst4.String(), srcTCP.Port, dstTCP.Port)
+	case src4 == nil && dst4 == nil:
+		return fmt.Appendf(nil, "PROXY TCP6 %s %s %d %d\r\n",
+			srcTCP.IP.String(), dstTCP.IP.String(), srcTCP.Port, dstTCP.Port)
+	default:
+		// Mixed families can't be represented in a single v1 line.
+		return []byte("PROXY UNKNOWN\r\n")
+	}
 }
 
 // pickTarget decides chat vs media. Uses MSG_PEEK so the bytes inspected here
