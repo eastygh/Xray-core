@@ -166,13 +166,13 @@ func (s *Selector) Process(ctx context.Context, network xnet.Network, conn stat.
 	errors.LogInfo(ctx, "routing to [", rule.handlerTag, "] sni=", sni,
 		" loopback=", rule.loopbackAddr != "")
 
+	if rule.loopbackAddr != "" {
+		return loopbackRelay(ctx, conn, rule.loopbackAddr, rule.proxyProtocol)
+	}
+
 	handler, err := s.inboundManager.GetHandler(ctx, rule.handlerTag)
 	if err != nil {
 		return errors.New("handler not found: ", rule.handlerTag).Base(err)
-	}
-
-	if rule.loopbackAddr != "" {
-		return loopbackRelayV2(ctx, conn, rule.loopbackAddr, rule.proxyProtocol)
 	}
 
 	if ib := session.InboundFromContext(ctx); ib != nil {
