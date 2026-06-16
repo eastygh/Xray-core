@@ -34,7 +34,7 @@ func init() {
 }
 
 const (
-	defaultReadSize    = 2048
+	defaultReadSize    = 16389
 	defaultPeekTimeout = 5 * time.Second
 	defaultMinPeekSize = 254
 )
