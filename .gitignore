@@ -40,6 +40,11 @@ errorgen
 # Build assets
 /build_assets/
 
+# Release script output and secrets
+/dist/
+/resources/
+.env
+
 # Output from dlv test
 **/debug.*
 
