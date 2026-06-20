@@ -26,7 +26,7 @@ var (
 var (
 	build    = "Custom"
 	codename = "Xray, Penetrates Everything."
-	intro    = "A unified platform for anti-censorship. (26.4.25)"
+	intro    = "A unified platform for anti-censorship."
 )
 
 func init() {
@@ -55,7 +55,7 @@ func init() {
 	if isDirty && foundBuild {
 		build += "-dirty"
 	}
-	build += "-ea"
+	build += "-26.4.25"
 }
 
 // Version returns Xray's version as a string, in the form of "x.y.z" where x, y and z are numbers.
