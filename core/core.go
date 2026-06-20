@@ -18,15 +18,15 @@ import (
 )
 
 var (
-	Version_x byte = 26
-	Version_y byte = 4
-	Version_z byte = 25
+	Version_x byte = 1
+	Version_y byte = 0
+	Version_z byte = 1
 )
 
 var (
 	build    = "Custom"
 	codename = "Xray, Penetrates Everything."
-	intro    = "A unified platform for anti-censorship."
+	intro    = "A unified platform for anti-censorship. (26.4.25)"
 )
 
 func init() {
@@ -55,6 +55,7 @@ func init() {
 	if isDirty && foundBuild {
 		build += "-dirty"
 	}
+	build += "-ea"
 }
 
 // Version returns Xray's version as a string, in the form of "x.y.z" where x, y and z are numbers.
