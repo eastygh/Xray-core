@@ -26,7 +26,9 @@ const (
 	fullHandlerKey            ctx.SessionKey = 10 // outbound gets full handler
 	mitmAlpn11Key             ctx.SessionKey = 11 // used by TLS dialer
 	mitmServerNameKey         ctx.SessionKey = 12 // used by TLS dialer
-	sniffedSNIKey             ctx.SessionKey = 13 // SNI already peeked by an upstream inbound (e.g. selector)
+
+	streamSettingsKey ctx.SessionKey = 13
+	sniffedSNIKey     ctx.SessionKey = 14 // SNI already peeked by an upstream inbound (e.g. selector)
 )
 
 func ContextWithInbound(ctx context.Context, inbound *Inbound) context.Context {
@@ -192,6 +194,14 @@ func MitmServerNameFromContext(ctx context.Context) string {
 		return val
 	}
 	return ""
+}
+
+func ContextWithStreamSettings(ctx context.Context, streamSettings any) context.Context {
+	return context.WithValue(ctx, streamSettingsKey, streamSettings)
+}
+
+func StreamSettingsFromContext(ctx context.Context) any {
+	return ctx.Value(streamSettingsKey)
 }
 
 func ContextWithSniffedSNI(ctx context.Context, sni string) context.Context {
