@@ -245,8 +245,28 @@ func requiresTransportSecurity(address *Address) bool {
 	return !geodata.GetPrivateDomainMatcher().MatchAny(domain)
 }
 
+func hasXorenTransport(streamSettings *internet.StreamConfig) bool {
+	if streamSettings == nil {
+		return false
+	}
+	if streamSettings.ProtocolName == "xoren" {
+		return true
+	}
+	for _, transport := range streamSettings.TransportSettings {
+		if transport.ProtocolName == "xoren" {
+			return true
+		}
+	}
+	return false
+}
+
 func validateOutboundTransportSecurity(rawConfig interface{}, senderSettings *proxyman.SenderConfig) error {
 	if senderSettings.StreamSettings != nil && senderSettings.StreamSettings.GetSecurityType() != "" {
+		return nil
+	}
+	// xoren transport XORs the stream on the wire, so it obfuscates traffic
+	// by itself and TLS is not required on top of it.
+	if hasXorenTransport(senderSettings.StreamSettings) {
 		return nil
 	}
 
