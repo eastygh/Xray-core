@@ -20,7 +20,7 @@ import (
 var (
 	Version_x byte = 1
 	Version_y byte = 0
-	Version_z byte = 5
+	Version_z byte = 6
 )
 
 var (
@@ -55,7 +55,7 @@ func init() {
 	if isDirty && foundBuild {
 		build += "-dirty"
 	}
-	build += "-26.7.28"
+	build += "-26.11.9"
 }
 
 // Version returns Xray's version as a string, in the form of "x.y.z" where x, y and z are numbers.
