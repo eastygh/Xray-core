@@ -125,6 +125,9 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 			if config.Concurrency == 0 {
 				config.Concurrency = 8 // same as before
 			}
+			if config.Concurrency > 0 && config.Concurrency < 128 && h.streamSettings != nil && h.streamSettings.ProtocolName == "xdrive" {
+				config.Concurrency = 128
+			}
 			if config.Concurrency > 0 {
 				h.mux = &mux.ClientManager{
 					Enabled: true,
@@ -134,7 +137,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 							Dialer: h,
 							Strategy: mux.ClientStrategy{
 								MaxConcurrency: uint32(config.Concurrency),
-								MaxConnection:  128,
+								MaxConnection:  1024,
 							},
 						},
 					},
@@ -155,7 +158,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 							Dialer: h,
 							Strategy: mux.ClientStrategy{
 								MaxConcurrency: uint32(config.XudpConcurrency),
-								MaxConnection:  128,
+								MaxConnection:  1024,
 							},
 						},
 					},

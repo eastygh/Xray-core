@@ -237,10 +237,11 @@ type OutboundDetourConfig struct {
 
 func requiresTransportSecurity(address *Address) bool {
 	if address == nil || address.Address == nil {
-		return false
+		return true
 	}
 	if address.Family().IsIP() {
-		return !geodata.GetPrivateIPMatcher().Match(address.IP())
+		ip := address.IP()
+		return !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast()
 	}
 	domain := strings.TrimSuffix(strings.ToLower(address.Domain()), ".")
 	return !geodata.GetPrivateDomainMatcher().MatchAny(domain)
@@ -406,7 +407,16 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 		return nil, errors.New("the masque transport can only be used by the masque outbound")
 	}
 
-	if fc, ok := ts.(*freedom.Config); ok {
+	if _, ok := rawConfig.(*BlackholeConfig); ok {
+		// The legacy blackhole outbound never used its transport settings.
+		senderSettings.StreamSettings = nil
+	} else if fc, ok := ts.(*freedom.Config); ok {
+		if legacy := rawConfig.(*FreedomConfig); legacy.ProxyProtocol > 0 && legacy.ProxyProtocol <= 2 {
+			if senderSettings.StreamSettings == nil {
+				senderSettings.StreamSettings = &internet.StreamConfig{}
+			}
+			addProxyProtocolMask(senderSettings.StreamSettings, legacy.ProxyProtocol)
+		}
 		if senderSettings.StreamSettings != nil &&
 			senderSettings.StreamSettings.SocketSettings != nil &&
 			senderSettings.StreamSettings.SocketSettings.AddressPortStrategy != internet.AddressPortStrategy_None {
@@ -608,7 +618,6 @@ func (c *Config) Build() (*core.Config, error) {
 	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dispatcher.Config{}),
-			serial.ToTypedMessage(&proxyman.InboundConfig{}),
 			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
 		},
 	}
@@ -717,6 +726,9 @@ func (c *Config) Build() (*core.Config, error) {
 		}
 		config.App = append(config.App, serial.ToTypedMessage(r))
 	}
+
+	// Initialize the inbound module last to ensure inbound connections are handled correctly.
+	config.App = append(config.App, serial.ToTypedMessage(&proxyman.InboundConfig{}))
 
 	var inbounds []InboundDetourConfig
 
